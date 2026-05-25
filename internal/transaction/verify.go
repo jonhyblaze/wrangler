@@ -1,4 +1,11 @@
 // Package transaction - verify.go runs post-copy xxHash verification.
+//
+// Because runner.go copies without a trailing slash, rsync places:
+//   - a source directory DCIM     → dest/DCIM/
+//   - a source file    video.mp4  → dest/video.mp4
+//
+// In both cases the effective root to verify is filepath.Join(dest, basename(source)).
+// This file implements that correctly.
 package transaction
 
 import (
@@ -15,10 +22,10 @@ import (
 
 // VerifyProgressMsg is a Bubbletea message carrying verification progress.
 type VerifyProgressMsg struct {
-	TxID     string
-	Checked  int64
-	Total    int64
-	Current  string
+	TxID    string
+	Checked int64
+	Total   int64
+	Current string
 }
 
 // VerifyDoneMsg signals that verification has completed.
@@ -69,33 +76,45 @@ func (v *Verifier) Start(ctx context.Context) {
 // run performs the full hash comparison.
 func (v *Verifier) run(ctx context.Context) (VerifyResult, error) {
 	result := VerifyResult{}
+	source := filepath.Clean(v.tx.Source)
 
 	// Build hash map for source.
-	sourceHashes, total, err := v.hashDirectory(ctx, v.tx.Source, 0, 0, nil)
+	sourceHashes, total, err := v.hashPath(ctx, source, source, 0, 0)
 	if err != nil {
 		return result, fmt.Errorf("hashing source: %w", err)
 	}
 	result.FilesTotal = total
 
-	// Count files across all destinations for accurate progress.
+	// Grand total for progress bar: source + all destinations.
 	grandTotal := total * int64(len(v.tx.Destinations)+1)
 
-	// Compare each destination against source.
 	var checked int64 = total
 	for _, dest := range v.tx.Destinations {
-		destHashes, _, err := v.hashDirectory(ctx, dest, checked, grandTotal, sourceHashes)
+		// rsync (no trailing slash) copied source item into dest.
+		// So the copy lives at dest/basename(source).
+		effectiveDest := filepath.Join(dest, filepath.Base(source))
+
+		if _, err := os.Stat(effectiveDest); err != nil {
+			result.Mismatches = append(result.Mismatches,
+				fmt.Sprintf("not found in %s: %s", dest, filepath.Base(source)))
+			continue
+		}
+
+		destHashes, _, err := v.hashPath(ctx, effectiveDest, effectiveDest, checked, grandTotal)
 		if err != nil {
-			return result, fmt.Errorf("hashing destination %s: %w", dest, err)
+			return result, fmt.Errorf("hashing destination %s: %w", effectiveDest, err)
 		}
 		checked += total
 
-		// Find mismatches.
+		// Compare: every source path must exist in dest with the same hash.
 		for relPath, srcHash := range sourceHashes {
 			destHash, exists := destHashes[relPath]
 			if !exists {
-				result.Mismatches = append(result.Mismatches, fmt.Sprintf("missing in %s: %s", dest, relPath))
+				result.Mismatches = append(result.Mismatches,
+					fmt.Sprintf("missing in %s: %s", effectiveDest, relPath))
 			} else if srcHash != destHash {
-				result.Mismatches = append(result.Mismatches, fmt.Sprintf("hash mismatch in %s: %s", dest, relPath))
+				result.Mismatches = append(result.Mismatches,
+					fmt.Sprintf("hash mismatch in %s: %s", effectiveDest, relPath))
 			}
 		}
 	}
@@ -105,19 +124,46 @@ func (v *Verifier) run(ctx context.Context) (VerifyResult, error) {
 	return result, nil
 }
 
-// hashDirectory walks a directory and returns a map of relative path → xxHash.
-func (v *Verifier) hashDirectory(
+// hashPath hashes a file or directory rooted at root.
+// For a file, returns {"." → hash}. For a directory, returns relative-path → hash.
+func (v *Verifier) hashPath(
 	ctx context.Context,
-	root string,
+	target string, // path to hash (file or dir)
+	root string,   // base for computing relative paths
 	startChecked int64,
 	grandTotal int64,
-	_ map[string]uint64, // unused, for future filtering
 ) (map[string]uint64, int64, error) {
 	hashes := make(map[string]uint64)
 	var count int64
 
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	info, err := os.Stat(target)
+	if err != nil {
+		return hashes, 0, err
+	}
+
+	if !info.IsDir() {
+		// Single-file source.
+		h, err := hashFile(target)
 		if err != nil {
+			return hashes, 0, err
+		}
+		hashes["."] = h
+		count = 1
+		select {
+		case v.progressCh <- VerifyProgressMsg{
+			TxID:    v.tx.ID,
+			Checked: startChecked + 1,
+			Total:   grandTotal,
+			Current: info.Name(),
+		}:
+		default:
+		}
+		return hashes, count, nil
+	}
+
+	// Directory: walk it.
+	err = filepath.WalkDir(target, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
 			return nil // skip inaccessible
 		}
 		if d.IsDir() {
@@ -135,28 +181,32 @@ func (v *Verifier) hashDirectory(
 			return nil
 		}
 
-		// Skip our own partial/report files.
-		if filepath.Base(relPath) == ".wrangler_partial" {
+		// Skip macOS clutter and our own artefacts.
+		base := filepath.Base(relPath)
+		if base == ".DS_Store" || base == ".wrangler_partial" ||
+			len(base) > 2 && base[:2] == "._" {
+			return nil
+		}
+		// Skip wrangler report files.
+		if len(base) > 16 && base[:16] == "wrangler_report_" {
 			return nil
 		}
 
 		h, err := hashFile(path)
 		if err != nil {
-			return nil // skip unreadable files
+			return nil // skip unreadable
 		}
 
 		hashes[relPath] = h
 		count++
 
-		// Send progress.
-		msg := VerifyProgressMsg{
+		select {
+		case v.progressCh <- VerifyProgressMsg{
 			TxID:    v.tx.ID,
 			Checked: startChecked + count,
 			Total:   grandTotal,
 			Current: relPath,
-		}
-		select {
-		case v.progressCh <- msg:
+		}:
 		default:
 		}
 
@@ -192,7 +242,7 @@ func hashFile(path string) (uint64, error) {
 	defer f.Close()
 
 	h := xxhash.New()
-	buf := make([]byte, 4*1024*1024) // 4MB buffer
+	buf := make([]byte, 4*1024*1024) // 4 MB read buffer
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return 0, err
 	}

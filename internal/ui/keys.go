@@ -9,16 +9,25 @@ type KeyMap struct {
 	Quit           key.Binding
 	NewTransaction key.Binding
 	Eject          key.Binding
-	Select         key.Binding
-	Up             key.Binding
-	Down           key.Binding
-	Pause          key.Binding
-	Cancel         key.Binding
-	Verify         key.Binding
-	OpenReport     key.Binding
-	Confirm        key.Binding
-	Back           key.Binding
-	ForceEject     key.Binding
+	// Browser navigation
+	NavigateInto key.Binding // Enter / → — go into a directory
+	NavigateUp   key.Binding // ← / Backspace — go to parent directory
+	Select       key.Binding // Space — select highlighted dir as source/dest
+	// List movement
+	Up   key.Binding
+	Down key.Binding
+	// Quick-jump keys (browser)
+	GotoHome    key.Binding
+	GotoVolumes key.Binding
+	// Transaction controls
+	Pause      key.Binding
+	Cancel     key.Binding
+	Verify     key.Binding
+	OpenReport key.Binding
+	// Confirmations
+	Confirm    key.Binding
+	Back       key.Binding
+	ForceEject key.Binding
 }
 
 // DefaultKeyMap returns the default keybindings.
@@ -40,9 +49,17 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("e"),
 			key.WithHelp("[e]", "eject"),
 		),
+		NavigateInto: key.NewBinding(
+			key.WithKeys("enter", "right", "l"),
+			key.WithHelp("[enter/→]", "open dir"),
+		),
+		NavigateUp: key.NewBinding(
+			key.WithKeys("left", "backspace", "h"),
+			key.WithHelp("[←/bksp]", "parent dir"),
+		),
 		Select: key.NewBinding(
-			key.WithKeys("enter", " "),
-			key.WithHelp("[enter]", "select"),
+			key.WithKeys(" "),
+			key.WithHelp("[space]", "select"),
 		),
 		Up: key.NewBinding(
 			key.WithKeys("up", "k"),
@@ -51,6 +68,14 @@ func DefaultKeyMap() KeyMap {
 		Down: key.NewBinding(
 			key.WithKeys("down", "j"),
 			key.WithHelp("[↓/j]", "down"),
+		),
+		GotoHome: key.NewBinding(
+			key.WithKeys("~"),
+			key.WithHelp("[~]", "home dir"),
+		),
+		GotoVolumes: key.NewBinding(
+			key.WithKeys("v"),
+			key.WithHelp("[v]", "/Volumes"),
 		),
 		Pause: key.NewBinding(
 			key.WithKeys("p"),
@@ -61,8 +86,8 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("[c]", "cancel"),
 		),
 		Verify: key.NewBinding(
-			key.WithKeys("v"),
-			key.WithHelp("[v]", "verify now"),
+			key.WithKeys("V"),
+			key.WithHelp("[V]", "verify now"),
 		),
 		OpenReport: key.NewBinding(
 			key.WithKeys("r"),

@@ -152,14 +152,33 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case media.EjectMsg:
 		m.confirmingEject = false
 		m.browser.confirmEject = false
-		if msg.Result.Success {
-			m.statusMsg = fmt.Sprintf("Ejected %s", msg.Result.MountPoint)
-		} else if msg.Result.Err == media.ErrBusy {
-			m.statusMsg = "Volume busy — press [f] to force eject"
+		m.browser.busyProcess = ""
+		r := msg.Result
+		switch {
+		case r.Success && r.AutoForced:
+			// System process was blocking — we force-ejected silently.
+			m.statusMsg = GreenStyle.Render("✓ ") + fmt.Sprintf("Force-ejected %s (system process released)", r.MountPoint)
+		case r.Success:
+			m.statusMsg = GreenStyle.Render("✓ ") + fmt.Sprintf("Ejected %s", r.MountPoint)
+		case r.Err == media.ErrBusy && r.BusyProcess != "":
+			// A specific user app is holding the volume — ask to force.
+			m.statusMsg = AmberStyle.Render("⚠ ") + fmt.Sprintf(
+				"%s is using this volume — [f] to force eject", r.BusyProcess)
+			// Re-enter confirmation state so [f] can force.
 			m.confirmingEject = true
 			m.forceEject = true
-		} else {
-			m.statusMsg = fmt.Sprintf("Eject failed: %v", msg.Result.Err)
+			m.browser.confirmEject = true
+			m.browser.ejectTarget = r.MountPoint
+			m.browser.busyProcess = r.BusyProcess
+		case r.Err == media.ErrBusy:
+			m.statusMsg = AmberStyle.Render("⚠ ") + "Volume busy — [f] to force eject"
+			m.confirmingEject = true
+			m.forceEject = true
+			m.browser.confirmEject = true
+			m.browser.ejectTarget = r.MountPoint
+			m.browser.busyProcess = ""
+		default:
+			m.statusMsg = RedStyle.Render("✗ ") + fmt.Sprintf("Eject failed: %v", r.Err)
 		}
 		return m, m.watcher.NextVolumeMsg()
 
@@ -189,10 +208,10 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.NewTransaction):
-		// [n] in any panel: start a new transaction flow.
-		if !m.browser.selectingDest {
-			m.activePanel = PanelBrowser
-			m.browser.Reset()
+		// [n] switches focus to the browser to start a new transaction.
+		m.activePanel = PanelBrowser
+		if m.browser.selectingDest {
+			m.browser.Reset() // cancel any in-progress selection
 		}
 		return m, nil
 	}
@@ -211,6 +230,30 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleBrowserKey processes key events for the browser panel.
 func (m AppModel) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Eject confirmation takes priority.
+	if m.browser.confirmEject {
+		switch {
+		case key.Matches(msg, m.keys.Confirm):
+			target := m.browser.ConfirmEject()
+			m.confirmingEject = false
+			if target != "" {
+				return m, media.EjectCmd(target, false)
+			}
+		case key.Matches(msg, m.keys.ForceEject):
+			target := m.browser.ConfirmEject()
+			m.confirmingEject = false
+			if target != "" {
+				return m, media.EjectCmd(target, true)
+			}
+		case key.Matches(msg, m.keys.Back):
+			m.browser.ConfirmEject()
+			m.browser.busyProcess = ""
+			m.confirmingEject = false
+			m.statusMsg = ""
+		}
+		return m, nil
+	}
+
 	switch {
 	case key.Matches(msg, m.keys.Up):
 		m.browser.MoveUp()
@@ -218,10 +261,26 @@ func (m AppModel) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Down):
 		m.browser.MoveDown()
 
+	case key.Matches(msg, m.keys.NavigateInto):
+		m.browser.NavigateInto()
+
+	case key.Matches(msg, m.keys.NavigateUp):
+		m.browser.NavigateUp()
+
+	case key.Matches(msg, m.keys.GotoHome):
+		m.browser.GotoHome()
+
+	case key.Matches(msg, m.keys.GotoVolumes):
+		if !m.browser.selectingDest {
+			m.browser.GotoVolumes()
+		}
+
 	case key.Matches(msg, m.keys.Back):
-		m.browser.Reset()
-		m.confirmingEject = false
-		m.forceEject = false
+		if m.browser.selectingDest {
+			m.browser.Reset()
+		} else {
+			m.browser.NavigateUp()
+		}
 
 	case key.Matches(msg, m.keys.Eject):
 		if !m.browser.selectingDest {
@@ -232,54 +291,29 @@ func (m AppModel) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case key.Matches(msg, m.keys.Confirm):
-		// [y] confirms eject.
-		if m.confirmingEject {
-			target := m.browser.ConfirmEject()
-			m.confirmingEject = false
-			if target != "" {
-				return m, media.EjectCmd(target, m.forceEject)
-			}
-		}
-
-	case key.Matches(msg, m.keys.ForceEject):
-		// [f] force eject.
-		if m.confirmingEject && m.browser.ejectTarget != "" {
-			target := m.browser.ConfirmEject()
-			m.confirmingEject = false
-			if target != "" {
-				return m, media.EjectCmd(target, true)
-			}
-		}
-
 	case key.Matches(msg, m.keys.Select):
-		if m.browser.confirmEject {
-			// Enter on eject confirmation = confirm.
-			target := m.browser.ConfirmEject()
-			m.confirmingEject = false
-			if target != "" {
-				return m, media.EjectCmd(target, m.forceEject)
-			}
-			return m, nil
-		}
-
+		// Space = select highlighted item as source then destination.
 		src, dests, ready := m.browser.Select()
 		if ready {
-			tx := transaction.New(src, dests)
-			m.transactions = append(m.transactions, tx)
-			m.queue.SetTransactions(m.transactions)
-			// Auto-focus the new transaction in detail panel.
-			newIdx := len(m.transactions) - 1
-			m.focusedTxIndex = newIdx
-			m.detail.SetTransaction(m.transactions[newIdx])
-			m.queue.focusedIndex = newIdx
-			m.queue.cursor = newIdx
-			// If nothing is running, start it.
-			return m, m.advanceQueue()
+			return m, m.createTransaction(src, dests)
 		}
+		_ = src // partial selection in progress
 	}
 
 	return m, nil
+}
+
+// createTransaction adds a new transaction and starts it if the queue is idle.
+func (m *AppModel) createTransaction(src string, dests []string) tea.Cmd {
+	tx := transaction.New(src, dests)
+	m.transactions = append(m.transactions, tx)
+	m.queue.SetTransactions(m.transactions)
+	newIdx := len(m.transactions) - 1
+	m.focusedTxIndex = newIdx
+	m.detail.SetTransaction(m.transactions[newIdx])
+	m.queue.focusedIndex = newIdx
+	m.queue.cursor = newIdx
+	return m.advanceQueue()
 }
 
 // handleDetailKey processes key events for the detail panel.
@@ -355,7 +389,8 @@ func (m AppModel) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Down):
 		m.queue.MoveDown()
 
-	case key.Matches(msg, m.keys.Select):
+	// Both Enter and Space focus the highlighted transaction in the detail panel.
+	case key.Matches(msg, m.keys.NavigateInto), key.Matches(msg, m.keys.Select):
 		focusMsg := m.queue.SelectCurrent()
 		if focusMsg.Index >= 0 && focusMsg.Index < len(m.transactions) {
 			m.focusedTxIndex = focusMsg.Index
@@ -415,6 +450,9 @@ func (m AppModel) View() string {
 	qm.height = contentH
 
 	// Render panels with borders.
+	// In Lipgloss v1.x Width/Height are the total outer dimensions (border +
+	// padding + content). Pass the full column widths so the three panels span
+	// exactly m.width together, matching the header and footer.
 	var browserStyle, detailStyle, queueStyle lipgloss.Style
 	if m.activePanel == PanelBrowser {
 		browserStyle = ActivePanelStyle
@@ -432,33 +470,21 @@ func (m AppModel) View() string {
 		queueStyle = PanelStyle
 	}
 
-	// Calculate inner widths (width minus border and padding).
-	bInner := bw - 4
-	dInner := dw - 4
-	qInner := qw - 4
-
-	if bInner < 1 {
-		bInner = 1
-	}
-	if dInner < 1 {
-		dInner = 1
-	}
-	if qInner < 1 {
-		qInner = 1
-	}
-
+	// Height(contentH - 2): Lipgloss Height is the inner content height; the
+	// two border rows (top + bottom) are added on top of it. Passing contentH
+	// directly would overflow the terminal by 2 rows, hiding the header.
 	browserPanel := browserStyle.
-		Width(bInner).
+		Width(bw).
 		Height(contentH - 2).
 		Render(bm.View())
 
 	detailPanel := detailStyle.
-		Width(dInner).
+		Width(dw).
 		Height(contentH - 2).
 		Render(dm.View())
 
 	queuePanel := queueStyle.
-		Width(qInner).
+		Width(qw).
 		Height(contentH - 2).
 		Render(qm.View())
 
@@ -488,31 +514,53 @@ func (m AppModel) renderHeader() string {
 	}
 
 	if m.statusMsg != "" {
-		right = MutedStyle.Render(m.statusMsg)
+		// statusMsg may already contain Lipgloss-rendered strings (e.g. colored ✓/✗).
+		// Use it directly so colour codes don't get double-rendered.
+		right = m.statusMsg
 	}
 
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	// Inner content width = outer (m.width) minus 1-char padding each side.
+	innerW := m.width - 2
+	if innerW < 2 {
+		innerW = 2
+	}
+
+	gap := innerW - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
 	}
 
-	header := left + strings.Repeat(" ", gap) + right
-	return HeaderStyle.Width(m.width - 2).Render(header)
+	titleRow := left + strings.Repeat(" ", gap) + right
+	// Separator gives the header a visible second row — the same look that the
+	// previous (accidental) text-wrap produced.
+	sepRow := DimStyle.Render(strings.Repeat("─", innerW))
+
+	return HeaderStyle.Width(m.width).Render(titleRow + "\n" + sepRow)
 }
 
 // renderFooter renders the bottom keybinding footer.
 func (m AppModel) renderFooter() string {
 	var parts []string
 
-	parts = append(parts, MutedStyle.Render("[tab]")+" switch panel")
-	parts = append(parts, MutedStyle.Render("[n]")+" new transaction")
+	parts = append(parts, MutedStyle.Render("[tab]")+" panels")
 
 	switch m.activePanel {
 	case PanelBrowser:
-		if m.browser.selectingDest {
-			parts = append(parts, MutedStyle.Render("[enter]")+" select dest")
+		if m.browser.confirmEject {
+			parts = append(parts, MutedStyle.Render("[y]")+" confirm eject")
+			parts = append(parts, MutedStyle.Render("[f]")+" force")
+			parts = append(parts, MutedStyle.Render("[esc]")+" cancel")
+		} else if m.browser.selectingDest {
+			parts = append(parts, MutedStyle.Render("[space]")+" set dest")
+			parts = append(parts, MutedStyle.Render("[→/enter]")+" open dir")
+			parts = append(parts, MutedStyle.Render("[←/bksp]")+" parent")
 			parts = append(parts, MutedStyle.Render("[esc]")+" cancel")
 		} else {
+			parts = append(parts, MutedStyle.Render("[space]")+" set source")
+			parts = append(parts, MutedStyle.Render("[→/enter]")+" open dir")
+			parts = append(parts, MutedStyle.Render("[←/bksp]")+" parent")
+			parts = append(parts, MutedStyle.Render("[~]")+" home")
+			parts = append(parts, MutedStyle.Render("[v]")+" /Volumes")
 			parts = append(parts, MutedStyle.Render("[e]")+" eject")
 		}
 	case PanelDetail:
@@ -527,16 +575,20 @@ func (m AppModel) renderFooter() string {
 				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
 			case transaction.StateDone:
 				parts = append(parts, MutedStyle.Render("[r]")+" open report")
+			case transaction.StateQueued:
+				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
 			}
 		}
+		parts = append(parts, MutedStyle.Render("[n]")+" new")
 	case PanelQueue:
-		parts = append(parts, MutedStyle.Render("[enter]")+" focus")
+		parts = append(parts, MutedStyle.Render("[enter/space]")+" focus")
+		parts = append(parts, MutedStyle.Render("[n]")+" new")
 	}
 
 	parts = append(parts, MutedStyle.Render("[q]")+" quit")
 
 	footer := strings.Join(parts, "  ")
-	return FooterStyle.Width(m.width - 2).Render(footer)
+	return FooterStyle.Width(m.width).Render(footer)
 }
 
 // panelWidths returns the widths of the three panels.

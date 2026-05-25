@@ -1,17 +1,23 @@
 // Package transaction - runner.go manages the rsync subprocess lifecycle.
+//
+// Progress tracking strategy:
+//
+//	Rsync stdout is fully pipe-buffered when not connected to a terminal —
+//	we only receive output when the 64 KB pipe buffer fills, or rsync exits.
+//	Parsing rsync's --progress output therefore gives unreliable real-time data.
+//
+//	Instead we poll the destination directory size every 500 ms.
+//	This is version-agnostic, works for both openrsync and GNU rsync, and gives
+//	smooth progress for files of any size.
 package transaction
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,27 +62,11 @@ type Runner struct {
 	isGNURsync bool
 	rsyncPath  string
 
-	// multi-destination tracking
-	destIndex    int
-	destCount    int
-	prevBytes    int64 // bytes done in prior destinations
-	totalBytes   int64 // pre-calculated total
-	totalFiles   int64
-	doneBytes    int64 // from current rsync run
-	doneFiles    int64 // from current rsync run
+	// Multi-destination state.
+	prevBytes  int64 // bytes already done in completed destinations
+	totalBytes int64 // source_size × destCount (for smooth overall progress bar)
+	totalFiles int64
 }
-
-// gnuRsyncRe matches GNU rsync --info=progress2 output.
-// Example: "      1.23G  45%  123.45MB/s    0:04:32 (xfr#1, ir-chk=10/20)"
-var gnuRsyncRe = regexp.MustCompile(
-	`\s*([\d.,]+[KMGTP]?)\s+(\d+)%\s+([\d.]+\s*[KMGTP]?B/s)\s+(\d+:\d+:\d+)`,
-)
-
-// openRsyncRe matches openrsync / legacy rsync --progress per-file output.
-// Example: "   1234567 100%  123.45kB/s  0:00:10"
-var openRsyncRe = regexp.MustCompile(
-	`([\d,]+)\s+(\d+)%\s+([\d.]+\s*[KMGTP]?B/s)\s+(\d+:\d+:\d+)`,
-)
 
 // NewRunner creates a new Runner for the given transaction.
 func NewRunner(tx *Transaction) *Runner {
@@ -90,66 +80,64 @@ func NewRunner(tx *Transaction) *Runner {
 	}
 }
 
-// Start begins the offload: pre-calculates sizes, then runs rsync for each destination.
-// This runs the actual work in a goroutine and returns immediately.
+// Start launches the offload goroutine.
 func (r *Runner) Start() {
 	r.rsyncPath, r.isGNURsync = findRsync()
-	r.destCount = len(r.tx.Destinations)
 
 	go func() {
-		// Pre-calculate source size.
-		bytes, files, err := calculateSize(r.tx.Source)
+		// Pre-calculate source size for progress bar and space check.
+		srcBytes, srcFiles, err := calculateSize(r.tx.Source)
 		if err != nil {
 			r.tx.SetError(fmt.Errorf("failed to calculate source size: %w", err))
 			r.doneCh <- err
 			return
 		}
-		r.totalBytes = bytes
-		r.totalFiles = files
+		// Total = source size × dest count so the progress bar spans all destinations.
+		r.totalBytes = srcBytes * int64(len(r.tx.Destinations))
+		r.totalFiles = srcFiles
 
-		// Check space on all destinations.
+		// Space check on every destination.
 		for _, dest := range r.tx.Destinations {
-			if err := checkSpace(dest, bytes); err != nil {
+			if err := checkSpace(dest, srcBytes); err != nil {
 				r.tx.SetError(err)
 				r.doneCh <- err
 				return
 			}
 		}
 
-		// Initial progress update.
-		p := TransferProgress{
-			BytesTotal: bytes,
-			FilesTotal: files,
+		// Publish initial progress (0 done).
+		r.tx.UpdateProgress(TransferProgress{
+			BytesTotal: r.totalBytes,
+			FilesTotal: r.totalFiles,
 			StartedAt:  time.Now(),
-		}
-		r.tx.UpdateProgress(p)
+		})
 
-		// Transition to running.
 		if err := r.tx.SetState(StateRunning); err != nil {
 			r.doneCh <- err
 			return
 		}
 
 		// Run rsync for each destination sequentially.
-		for i, dest := range r.tx.Destinations {
-			r.mu.Lock()
-			r.destIndex = i
-			r.doneBytes = 0
-			r.doneFiles = 0
-			r.mu.Unlock()
+		for _, dest := range r.tx.Destinations {
+			// Poll destination size while rsync writes, giving real-time progress.
+			pollerDone := make(chan struct{})
+			go r.pollDestProgress(dest, srcBytes, pollerDone)
 
-			if err := r.runRsync(dest); err != nil {
-				r.tx.SetError(fmt.Errorf("rsync to %s failed: %w", dest, err))
-				r.doneCh <- err
+			rsyncErr := r.runRsync(dest)
+			close(pollerDone) // stop poller regardless of rsync result
+
+			if rsyncErr != nil {
+				r.tx.SetError(fmt.Errorf("rsync to %s failed: %w", dest, rsyncErr))
+				r.doneCh <- rsyncErr
 				return
 			}
 
+			// Advance the cumulative offset.
 			r.mu.Lock()
-			r.prevBytes += r.doneBytes
+			r.prevBytes += srcBytes
 			r.mu.Unlock()
 		}
 
-		// Transition to verifying.
 		if err := r.tx.SetState(StateVerifying); err != nil {
 			r.doneCh <- err
 			return
@@ -158,7 +146,60 @@ func (r *Runner) Start() {
 	}()
 }
 
+// pollDestProgress polls the destination directory every 500 ms and pushes
+// TransferProgress updates into progressCh.
+func (r *Runner) pollDestProgress(dest string, srcBytes int64, done <-chan struct{}) {
+	// rsync (no trailing slash) puts the copy at dest/basename(source).
+	effectiveDest := filepath.Join(dest, filepath.Base(r.tx.Source))
+	partialDir := filepath.Join(dest, ".wrangler_partial")
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-r.cancelCtx.Done():
+			return
+		case <-ticker.C:
+			// Sum completed files + in-progress partial files.
+			doneBytes, doneFiles, _ := calculateSize(effectiveDest)
+			partialBytes, _, _ := calculateSize(partialDir)
+
+			r.mu.Lock()
+			currentTotal := doneBytes + partialBytes + r.prevBytes
+			r.updateSpeed(currentTotal)
+			speed := r.rollingSpeed()
+			r.mu.Unlock()
+
+			eta := 0
+			if speed > 0 && r.totalBytes > currentTotal {
+				eta = int(float64(r.totalBytes-currentTotal) / float64(speed))
+			}
+
+			p := TransferProgress{
+				BytesDone:   currentTotal,
+				BytesTotal:  r.totalBytes,
+				FilesDone:   doneFiles,
+				FilesTotal:  r.totalFiles,
+				SpeedBPS:    speed,
+				ETASecs:     eta,
+				StartedAt:   r.tx.Progress.StartedAt,
+				LastUpdated: time.Now(),
+			}
+
+			r.tx.UpdateProgress(p)
+			select {
+			case r.progressCh <- p:
+			default:
+			}
+		}
+	}
+}
+
 // runRsync executes rsync from source to one destination.
+// Stdout and stderr are captured for error reporting only (not parsed for progress).
 func (r *Runner) runRsync(dest string) error {
 	select {
 	case <-r.cancelCtx.Done():
@@ -166,24 +207,22 @@ func (r *Runner) runRsync(dest string) error {
 	default:
 	}
 
-	// Ensure destination exists.
 	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return fmt.Errorf("create destination: %w", err)
+		return fmt.Errorf("create destination directory: %w", err)
+	}
+	// Pre-create the partial/temp directory so rsync can use it immediately.
+	if err := os.MkdirAll(filepath.Join(dest, ".wrangler_partial"), 0o755); err != nil {
+		return fmt.Errorf("create partial directory: %w", err)
 	}
 
 	args := r.buildArgs(dest)
 	cmd := exec.CommandContext(r.cancelCtx, r.rsyncPath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Capture both stdout and stderr.
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
+	// Capture combined output — used only for error messages.
+	var outBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start rsync: %w", err)
@@ -194,178 +233,130 @@ func (r *Runner) runRsync(dest string) error {
 	r.pgid = cmd.Process.Pid // with Setpgid=true, pgid == pid
 	r.mu.Unlock()
 
-	// Parse progress in a goroutine.
-	go r.parseProgress(stdout)
-	// Drain stderr to prevent blocking.
-	var stderrBuf strings.Builder
-	go func() { io.Copy(&stderrBuf, stderr) }()
-
 	waitErr := cmd.Wait()
 
 	if waitErr != nil {
-		// If it was cancelled, return context error instead.
 		if r.cancelCtx.Err() != nil {
 			return r.cancelCtx.Err()
 		}
-		return fmt.Errorf("%w\nstderr: %s", waitErr, stderrBuf.String())
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			switch exitErr.ExitCode() {
+			case 23:
+				// Partial transfer — usually macOS extended attributes.
+				// File data was copied; xxHash verification will confirm.
+				return nil
+			case 24:
+				// Source files vanished mid-copy (harmless for camera cards).
+				return nil
+			}
+		}
+		return describeRsyncError(waitErr, strings.TrimSpace(outBuf.String()))
 	}
 	return nil
 }
 
 // buildArgs constructs the rsync argument list.
 func (r *Runner) buildArgs(dest string) []string {
-	src := r.tx.Source
-	// Trailing slash: copy contents of directory, not the directory itself.
-	if !strings.HasSuffix(src, "/") {
-		src += "/"
-	}
+	// No trailing slash: rsync copies the directory/file itself into dest,
+	// preserving its name. With a trailing slash rsync copies only contents.
+	src := filepath.Clean(r.tx.Source)
+
+	// Use absolute paths for partial/temp dirs so rsync resolves them correctly
+	// regardless of its working directory.
+	partialPath := filepath.Join(dest, ".wrangler_partial")
 
 	args := []string{
 		"--archive",
 		"--human-readable",
 		"--partial",
-		"--partial-dir=.wrangler_partial",
+		// Keep interrupted partial files in partialPath so they can be resumed.
+		"--partial-dir=" + partialPath,
+		// Write in-progress temp files to partialPath as well.
+		// Without this, rsync writes its temp file as a hidden file in dest
+		// (e.g. dest/.filename.XXXXXX), which is outside the directory we poll
+		// for progress. Redirecting temp files here means calculateSize(partialPath)
+		// captures live write progress for both single-file and directory sources.
+		"--temp-dir=" + partialPath,
+		// Cross-filesystem safety (exFAT → APFS): skip Unix metadata.
+		"--no-perms",
+		"--no-owner",
+		"--no-group",
+		// Skip macOS clutter that causes exit 23 on exFAT sources.
+		"--exclude=.DS_Store",
+		"--exclude=._*",
+		"--exclude=.Spotlight-V100",
+		"--exclude=.fseventsd",
+		"--exclude=.Trashes",
 	}
 
+	// GNU rsync: protect paths with spaces, brackets, or other special chars.
 	if r.isGNURsync {
-		args = append(args, "--info=progress2", "--no-inc-recursive")
-	} else {
-		args = append(args, "--progress")
+		args = append(args, "--protect-args")
 	}
 
 	args = append(args, src, dest)
 	return args
 }
 
-// parseProgress reads rsync stdout and sends TransferProgress updates to progressCh.
-func (r *Runner) parseProgress(rd io.Reader) {
-	scanner := bufio.NewScanner(rd)
-	// Custom split function: split on \r or \n.
-	scanner.Split(splitOnCR)
+// describeRsyncError returns a human-friendly error for common rsync failures.
+func describeRsyncError(rsyncErr error, output string) error {
+	lower := strings.ToLower(output)
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		var p *TransferProgress
-		if r.isGNURsync {
-			p = r.parseGNULine(line)
-		} else {
-			p = r.parseOpenRsyncLine(line)
-		}
-
-		if p != nil {
-			select {
-			case r.progressCh <- *p:
-			default:
-				// Drop if buffer full — UI will catch up.
+	switch {
+	case strings.Contains(lower, "permission denied") || strings.Contains(lower, "operation not permitted"):
+		// Detect macOS TCC-protected paths.
+		protected := []string{"music", "photos", "desktop", "documents", "downloads"}
+		for _, p := range protected {
+			if strings.Contains(lower, p) {
+				return fmt.Errorf(
+					"macOS blocked access to a protected folder.\n"+
+						"Grant Full Disk Access to your terminal:\n"+
+						"System Settings › Privacy & Security › Full Disk Access\n\n"+
+						"rsync error: %s",
+					output,
+				)
 			}
 		}
+		return fmt.Errorf("permission denied:\n%s", output)
+
+	case strings.Contains(lower, "no space left") || strings.Contains(lower, "disk full"):
+		return fmt.Errorf("destination disk is full:\n%s", output)
+
+	case strings.Contains(lower, "read-only file system"):
+		return fmt.Errorf("destination is read-only:\n%s", output)
+
+	case strings.Contains(lower, "file name too long"):
+		return fmt.Errorf(
+			"a filename is too long for the destination filesystem.\n"+
+				"Some FAT32/exFAT volumes limit filenames to 255 bytes.\n\n"+
+				"rsync error: %s",
+			output,
+		)
+
+	case output != "":
+		return fmt.Errorf("%w\n%s", rsyncErr, output)
+
+	default:
+		return rsyncErr
 	}
 }
 
-// parseGNULine parses a GNU rsync --info=progress2 progress line.
-func (r *Runner) parseGNULine(line string) *TransferProgress {
-	m := gnuRsyncRe.FindStringSubmatch(line)
-	if m == nil {
-		return nil
-	}
+// ── Speed tracking ────────────────────────────────────────────────────────────
 
-	pct, _ := strconv.ParseFloat(m[2], 64)
-	speedBPS := parseSpeedStr(m[3])
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Calculate bytes done from percentage of total.
-	bytesDone := int64(pct/100.0*float64(r.totalBytes)) + r.prevBytes
-
-	r.updateSpeed(bytesDone, speedBPS)
-
-	now := time.Now()
-	r.doneBytes = int64(pct / 100.0 * float64(r.totalBytes))
-
-	eta := 0
-	if speedBPS > 0 && r.totalBytes > bytesDone {
-		eta = int(float64(r.totalBytes-bytesDone) / float64(speedBPS))
-	}
-
-	return &TransferProgress{
-		BytesDone:   bytesDone,
-		BytesTotal:  r.totalBytes,
-		FilesTotal:  r.totalFiles,
-		SpeedBPS:    r.rollingSpeed(),
-		ETASecs:     eta,
-		LastUpdated: now,
-		StartedAt:   r.tx.Progress.StartedAt,
-	}
-}
-
-// parseOpenRsyncLine parses a legacy rsync --progress per-file line.
-func (r *Runner) parseOpenRsyncLine(line string) *TransferProgress {
-	m := openRsyncRe.FindStringSubmatch(line)
-	if m == nil {
-		// Check if it's a filename line (no match on the progress pattern).
-		return nil
-	}
-
-	bytesStr := strings.ReplaceAll(m[1], ",", "")
-	fileBytes, _ := strconv.ParseInt(bytesStr, 10, 64)
-	pct, _ := strconv.ParseFloat(m[2], 64)
-	speedBPS := parseSpeedStr(m[3])
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// For openrsync, accumulate files when they hit 100%.
-	if pct == 100 {
-		r.doneFiles++
-		r.doneBytes += fileBytes
-	}
-
-	totalDone := r.doneBytes + r.prevBytes
-	r.updateSpeed(totalDone, speedBPS)
-
-	now := time.Now()
-	eta := 0
-	rollingSpd := r.rollingSpeed()
-	if rollingSpd > 0 && r.totalBytes > totalDone {
-		eta = int(float64(r.totalBytes-totalDone) / float64(rollingSpd))
-	}
-
-	return &TransferProgress{
-		BytesDone:   totalDone,
-		BytesTotal:  r.totalBytes,
-		FilesDone:   r.doneFiles + (r.prevBytes / max64(1, r.totalBytes/max64(1, r.totalFiles))),
-		FilesTotal:  r.totalFiles,
-		SpeedBPS:    rollingSpd,
-		ETASecs:     eta,
-		LastUpdated: now,
-		StartedAt:   r.tx.Progress.StartedAt,
-	}
-}
-
-// updateSpeed adds a sample to the rolling speed buffer.
-// Must be called with r.mu held.
-func (r *Runner) updateSpeed(bytesDone, reportedBPS int64) {
-	_ = reportedBPS // use our own rolling average
-	now := time.Now()
-	r.speedBuf[r.speedIdx] = speedSample{t: now, bytes: bytesDone}
+// updateSpeed adds a sample to the rolling speed buffer. Must hold r.mu.
+func (r *Runner) updateSpeed(bytesDone int64) {
+	r.speedBuf[r.speedIdx] = speedSample{t: time.Now(), bytes: bytesDone}
 	r.speedIdx = (r.speedIdx + 1) % len(r.speedBuf)
 	if r.speedFilled < len(r.speedBuf) {
 		r.speedFilled++
 	}
 }
 
-// rollingSpeed returns the rolling average speed in bytes/sec.
-// Must be called with r.mu held.
+// rollingSpeed returns the rolling average speed in bytes/sec. Must hold r.mu.
 func (r *Runner) rollingSpeed() int64 {
 	if r.speedFilled < 2 {
 		return 0
 	}
-	// Find oldest sample.
 	oldestIdx := r.speedIdx
 	for i := 0; i < r.speedFilled-1; i++ {
 		oldestIdx = (oldestIdx - 1 + len(r.speedBuf)) % len(r.speedBuf)
@@ -374,15 +365,17 @@ func (r *Runner) rollingSpeed() int64 {
 	oldest := r.speedBuf[oldestIdx]
 
 	elapsed := newest.t.Sub(oldest.t).Seconds()
-	if elapsed < 0.01 {
+	if elapsed < 0.1 {
 		return 0
 	}
-	bytesDelta := newest.bytes - oldest.bytes
-	if bytesDelta < 0 {
-		bytesDelta = 0
+	delta := newest.bytes - oldest.bytes
+	if delta < 0 {
+		delta = 0
 	}
-	return int64(math.Round(float64(bytesDelta) / elapsed))
+	return int64(math.Round(float64(delta) / elapsed))
 }
+
+// ── Lifecycle controls ────────────────────────────────────────────────────────
 
 // Pause sends SIGSTOP to the rsync process group.
 func (r *Runner) Pause() error {
@@ -406,7 +399,7 @@ func (r *Runner) Resume() error {
 	return syscall.Kill(-pgid, syscall.SIGCONT)
 }
 
-// Cancel terminates the rsync process group and cleans up partial files.
+// Cancel terminates the rsync process group and removes partial files.
 func (r *Runner) Cancel() {
 	r.cancelFn()
 
@@ -416,21 +409,19 @@ func (r *Runner) Cancel() {
 	r.mu.Unlock()
 
 	if pgid != 0 {
-		// SIGCONT first in case the process is stopped; SIGKILL cannot be delivered to stopped processes.
+		// SIGCONT first: SIGKILL cannot reach a stopped (SIGSTOP'd) process.
 		_ = syscall.Kill(-pgid, syscall.SIGCONT)
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	}
 
-	// Clean up partial files.
 	for _, dest := range dests {
-		partialDir := filepath.Join(dest, ".wrangler_partial")
-		_ = os.RemoveAll(partialDir)
+		_ = os.RemoveAll(filepath.Join(dest, ".wrangler_partial"))
 	}
 
 	r.tx.SetStateForce(StateCancelled)
 }
 
-// NextProgressMsg returns a tea.Cmd that waits for the next progress update.
+// NextProgressMsg returns a tea.Cmd that delivers the next progress or done event.
 func (r *Runner) NextProgressMsg() tea.Cmd {
 	return func() tea.Msg {
 		select {
@@ -438,24 +429,24 @@ func (r *Runner) NextProgressMsg() tea.Cmd {
 			if !ok {
 				return nil
 			}
-			r.tx.UpdateProgress(p)
 			return ProgressMsg{TxID: r.tx.ID, Progress: p}
 		case err := <-r.doneCh:
 			return RunnerDoneMsg{TxID: r.tx.ID, Err: err}
-		case <-time.After(200 * time.Millisecond):
-			// Timeout: return a tick so UI can check for state changes.
+		case <-time.After(300 * time.Millisecond):
+			// Heartbeat: return current snapshot so UI stays alive.
 			return ProgressMsg{TxID: r.tx.ID, Progress: r.tx.Snapshot().Progress}
 		}
 	}
 }
 
-// findRsync returns the path to rsync and whether it is GNU rsync.
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// findRsync returns the path to rsync and whether it is GNU rsync v3+.
 func findRsync() (string, bool) {
-	// Prefer Homebrew GNU rsync on Apple Silicon.
 	candidates := []string{
-		"/opt/homebrew/bin/rsync",
-		"/usr/local/bin/rsync",
-		"/usr/bin/rsync",
+		"/opt/homebrew/bin/rsync",  // Apple Silicon Homebrew
+		"/usr/local/bin/rsync",     // Intel Homebrew
+		"/usr/bin/rsync",           // macOS system (openrsync)
 	}
 	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {
@@ -466,7 +457,6 @@ func findRsync() (string, bool) {
 			return p, false
 		}
 	}
-	// Fall back to PATH.
 	if path, err := exec.LookPath("rsync"); err == nil {
 		out, err := exec.Command(path, "--version").Output()
 		if err == nil && strings.Contains(string(out), "rsync  version 3") {
@@ -481,7 +471,7 @@ func findRsync() (string, bool) {
 func calculateSize(path string) (bytes int64, files int64, err error) {
 	err = filepath.WalkDir(path, func(_ string, d os.DirEntry, e error) error {
 		if e != nil {
-			return nil // skip inaccessible files
+			return nil // skip inaccessible
 		}
 		if !d.IsDir() {
 			info, err := d.Info()
@@ -495,63 +485,37 @@ func calculateSize(path string) (bytes int64, files int64, err error) {
 	return
 }
 
-// checkSpace verifies the destination has enough free space.
+// checkSpace verifies the destination filesystem has enough free space.
 func checkSpace(dest string, required int64) error {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(dest, &stat); err != nil {
-		return nil // can't check, proceed
+		return nil // can't check; proceed optimistically
 	}
 	free := int64(stat.Bavail) * int64(stat.Bsize)
 	if free < required {
 		return fmt.Errorf(
-			"insufficient space on %s: need %d bytes, have %d bytes free",
-			dest, required, free,
+			"not enough space on %s: need %s, have %s free",
+			dest,
+			humanBytes(required),
+			humanBytes(free),
 		)
 	}
 	return nil
 }
 
-// parseSpeedStr parses a speed string like "123.45MB/s" or "4.5 KB/s" into bytes/sec.
-func parseSpeedStr(s string) int64 {
-	s = strings.TrimSpace(s)
-	s = strings.ReplaceAll(s, " ", "")
-
-	var multiplier float64 = 1
+// humanBytes formats bytes without importing the humanize package (avoids cycle).
+func humanBytes(n int64) string {
+	const GB = 1 << 30
+	const MB = 1 << 20
+	const KB = 1 << 10
 	switch {
-	case strings.Contains(s, "GB/s"):
-		multiplier = 1024 * 1024 * 1024
-		s = strings.ReplaceAll(s, "GB/s", "")
-	case strings.Contains(s, "MB/s"):
-		multiplier = 1024 * 1024
-		s = strings.ReplaceAll(s, "MB/s", "")
-	case strings.Contains(s, "KB/s"), strings.Contains(s, "kB/s"):
-		multiplier = 1024
-		s = strings.ReplaceAll(strings.ReplaceAll(s, "KB/s", ""), "kB/s", "")
-	case strings.Contains(s, "B/s"):
-		multiplier = 1
-		s = strings.ReplaceAll(s, "B/s", "")
+	case n >= GB:
+		return fmt.Sprintf("%.1f GB", float64(n)/GB)
+	case n >= MB:
+		return fmt.Sprintf("%.1f MB", float64(n)/MB)
+	case n >= KB:
+		return fmt.Sprintf("%.1f KB", float64(n)/KB)
+	default:
+		return fmt.Sprintf("%d B", n)
 	}
-
-	v, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	return int64(v * multiplier)
-}
-
-// splitOnCR is a bufio.SplitFunc that splits on \r or \n.
-func splitOnCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	for i, b := range data {
-		if b == '\r' || b == '\n' {
-			return i + 1, data[:i], nil
-		}
-	}
-	if atEOF && len(data) > 0 {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

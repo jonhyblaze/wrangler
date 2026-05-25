@@ -217,12 +217,12 @@ func (m DetailModel) renderFailed(snap transaction.TxSnapshot, width int) string
 	lines = append(lines, RedStyle.Render("FAILED ✗"))
 
 	if snap.Err != nil {
-		errMsg := snap.Err.Error()
-		// Wrap long error messages.
-		if len(errMsg) > width {
-			errMsg = errMsg[:width-3] + "..."
+		// Split on embedded newlines first, then soft-wrap each paragraph at width.
+		for _, para := range strings.Split(snap.Err.Error(), "\n") {
+			for _, wrapped := range softWrap(para, width) {
+				lines = append(lines, RedStyle.Render(wrapped))
+			}
 		}
-		lines = append(lines, RedStyle.Render(errMsg))
 	}
 
 	if len(snap.Verify.Mismatches) > 0 {
@@ -237,6 +237,48 @@ func (m DetailModel) renderFailed(snap transaction.TxSnapshot, width int) string
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// softWrap splits s into lines of at most maxWidth runes, breaking at spaces
+// where possible. Returns at least one element (an empty string for empty input).
+func softWrap(s string, maxWidth int) []string {
+	if maxWidth < 4 {
+		maxWidth = 4
+	}
+	if s == "" {
+		return []string{""}
+	}
+
+	var out []string
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return []string{""}
+	}
+
+	cur := ""
+	for _, w := range words {
+		// A single word longer than maxWidth — hard-break it.
+		for len(w) > maxWidth {
+			if cur != "" {
+				out = append(out, cur)
+				cur = ""
+			}
+			out = append(out, w[:maxWidth])
+			w = w[maxWidth:]
+		}
+		if cur == "" {
+			cur = w
+		} else if len(cur)+1+len(w) <= maxWidth {
+			cur += " " + w
+		} else {
+			out = append(out, cur)
+			cur = w
+		}
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	return out
 }
 
 func (m DetailModel) renderCancelled(snap transaction.TxSnapshot, width int) string {

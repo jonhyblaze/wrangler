@@ -1,10 +1,27 @@
 // Package ui - browser.go implements the file browser panel (left).
+//
+// Layout:
+//
+//	QUICK ACCESS          ← always-visible bookmarks (volumes + common folders)
+//	─────────────────
+//	[C] CARD_A  28 GB
+//	[D] SSD_01
+//	  Desktop
+//	  Movies
+//	─────────────────
+//	/current/path         ← directory navigator below
+//	─────────────────
+//	↑ ..
+//	▸ DCIM/
+//	▸ MISC/
+//	  thumbnail.jpg       ← files shown; selectable as source only
 package ui
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -12,162 +29,301 @@ import (
 	"github.com/jonhyblaze/wrangler/pkg/humanize"
 )
 
-// BrowserItem represents one row in the file browser.
-type BrowserItem struct {
-	label       string
-	path        string
-	isVolume    bool
+// browserEntry is a single row in the unified entry list.
+type browserEntry struct {
+	name  string
+	path  string
+
+	// Type flags — only one should be true at a time (except isBookmark + isVolume).
+	isDir        bool
+	isParent     bool // ".." entry
+	isHeader     bool // section label, not selectable
+	isSeparator  bool // horizontal rule, not selectable
+	isBookmark   bool // top-section quick-access entry
+
+	// Volume metadata (set when isBookmark && isVolume).
+	isVolume     bool
 	isCameraCard bool
-	isHeader    bool // group header, not selectable
-	freeBytes   int64
-	totalBytes  int64
+	freeBytes    int64
 }
 
 // BrowserModel is the file browser panel state.
 type BrowserModel struct {
-	volumes       []media.VolumeInfo
-	bookmarks     []string
-	items         []BrowserItem
+	currentPath string
+	dirEntries  []browserEntry // contents of currentPath (reloaded on navigation)
+	volumes     []media.VolumeInfo
+
 	cursor        int
-	width         int
-	height        int
+	width, height int
+
+	// Selection state for new-transaction flow.
 	selectedSource string
 	selectingDest  bool
 	selectedDests  []string // up to 2
-	ejectTarget   string   // path being confirmed for eject
-	confirmEject  bool
+
+	// Eject confirmation.
+	ejectTarget  string
+	confirmEject bool
+	busyProcess  string // process name blocking eject (empty = unknown)
 }
 
-// NewBrowser creates a new BrowserModel.
+// NewBrowser creates a BrowserModel starting at /Volumes.
 func NewBrowser(volumes []media.VolumeInfo) BrowserModel {
-	home, _ := os.UserHomeDir()
-	bookmarks := []string{
-		home,
-		filepath.Join(home, "Movies"),
-		filepath.Join(home, "Desktop"),
-		filepath.Join(home, "Downloads"),
+	m := BrowserModel{volumes: volumes}
+	start := "/Volumes"
+	if _, err := os.Stat(start); err != nil {
+		home, _ := os.UserHomeDir()
+		start = home
 	}
-
-	m := BrowserModel{
-		volumes:   volumes,
-		bookmarks: bookmarks,
-	}
-	m.rebuildItems()
+	m.navigateTo(start)
 	return m
 }
 
-// SetVolumes updates the volume list and rebuilds the item list.
+// SetVolumes refreshes volume metadata (called when watcher detects a change).
 func (m *BrowserModel) SetVolumes(vols []media.VolumeInfo) {
 	m.volumes = vols
-	m.rebuildItems()
+	m.reloadDir() // refresh in case a volume appeared/disappeared in currentPath
 }
 
-// rebuildItems flattens volumes and bookmarks into a display list.
-func (m *BrowserModel) rebuildItems() {
-	m.items = nil
+// ── Navigation ────────────────────────────────────────────────────────────────
 
-	// Volumes section.
-	m.items = append(m.items, BrowserItem{label: "VOLUMES", isHeader: true})
+func (m *BrowserModel) navigateTo(path string) {
+	path = filepath.Clean(path)
+	m.currentPath = path
+	m.reloadDir()
+	// Position cursor on first selectable entry.
+	all := m.all()
+	for i, e := range all {
+		if !e.isHeader && !e.isSeparator {
+			m.cursor = i
+			return
+		}
+	}
+	m.cursor = 0
+}
+
+// reloadDir refreshes m.dirEntries from the filesystem.
+func (m *BrowserModel) reloadDir() {
+	m.dirEntries = nil
+
+	// ".." parent entry (not at root).
+	if m.currentPath != "/" {
+		m.dirEntries = append(m.dirEntries, browserEntry{
+			name:     "..",
+			path:     filepath.Dir(m.currentPath),
+			isDir:    true,
+			isParent: true,
+		})
+	}
+
+	des, err := os.ReadDir(m.currentPath)
+	if err != nil {
+		m.dirEntries = append(m.dirEntries, browserEntry{
+			name: fmt.Sprintf("(cannot read: %v)", err),
+		})
+		return
+	}
+
+	var dirs, files []browserEntry
+	for _, de := range des {
+		name := de.Name()
+		if strings.HasPrefix(name, ".") {
+			continue // skip hidden
+		}
+		fullPath := filepath.Join(m.currentPath, name)
+		isDir := de.IsDir()
+		e := browserEntry{name: name, path: fullPath, isDir: isDir}
+
+		// Annotate /Volumes children with camera-card / free-space info.
+		if m.currentPath == "/Volumes" && isDir {
+			for _, v := range m.volumes {
+				if v.MountPoint == fullPath {
+					e.isVolume = true
+					e.isCameraCard = v.IsCamera
+					e.freeBytes = v.FreeBytes
+					break
+				}
+			}
+		}
+
+		if isDir {
+			dirs = append(dirs, e)
+		} else {
+			files = append(files, e)
+		}
+	}
+
+	sortByName := func(s []browserEntry) {
+		sort.Slice(s, func(i, j int) bool {
+			return strings.ToLower(s[i].name) < strings.ToLower(s[j].name)
+		})
+	}
+	sortByName(dirs)
+	sortByName(files)
+
+	m.dirEntries = append(m.dirEntries, dirs...)
+	m.dirEntries = append(m.dirEntries, files...)
+}
+
+// all returns the combined entry list: bookmarks + separator + dirEntries.
+// Recomputed on every call (cheap; entries are small).
+func (m BrowserModel) all() []browserEntry {
+	var out []browserEntry
+
+	// ── QUICK ACCESS header ──────────────────────────────────────────────────
+	out = append(out, browserEntry{isHeader: true, name: "QUICK ACCESS"})
+
+	// Removable volumes from watcher.
 	for _, v := range m.volumes {
-		label := v.Name
-		item := BrowserItem{
-			label:        label,
+		out = append(out, browserEntry{
+			name:         v.Name,
 			path:         v.MountPoint,
+			isDir:        true,
+			isBookmark:   true,
 			isVolume:     true,
 			isCameraCard: v.IsCamera,
 			freeBytes:    v.FreeBytes,
-			totalBytes:   v.TotalBytes,
-		}
-		m.items = append(m.items, item)
-	}
-	if len(m.volumes) == 0 {
-		m.items = append(m.items, BrowserItem{label: "  (no volumes mounted)", isHeader: true})
+		})
 	}
 
-	// Bookmarks section.
-	m.items = append(m.items, BrowserItem{label: "", isHeader: true}) // spacer
-	m.items = append(m.items, BrowserItem{label: "BOOKMARKS", isHeader: true})
-	for _, b := range m.bookmarks {
-		if _, err := os.Stat(b); err == nil {
-			m.items = append(m.items, BrowserItem{
-				label:    filepath.Base(b),
-				path:     b,
-				isVolume: false,
+	// Common home-directory bookmarks.
+	home, _ := os.UserHomeDir()
+	bmFolders := []struct{ label, subdir string }{
+		{"Desktop", "Desktop"},
+		{"Movies", "Movies"},
+		{"Pictures", "Pictures"},
+		{"Music", "Music"},
+		{"Downloads", "Downloads"},
+	}
+	for _, bm := range bmFolders {
+		p := filepath.Join(home, bm.subdir)
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, browserEntry{
+				name:       bm.label,
+				path:       p,
+				isDir:      true,
+				isBookmark: true,
 			})
 		}
 	}
 
-	// Clamp cursor.
-	if m.cursor >= len(m.items) {
-		m.cursor = max(0, len(m.items)-1)
+	// ── Separator ────────────────────────────────────────────────────────────
+	out = append(out, browserEntry{isSeparator: true})
+
+	// ── Current directory listing ─────────────────────────────────────────
+	out = append(out, m.dirEntries...)
+
+	return out
+}
+
+// NavigateInto opens the highlighted directory (or follows ".." / a bookmark).
+func (m *BrowserModel) NavigateInto() bool {
+	e, ok := m.current()
+	if !ok || !e.isDir {
+		return false
+	}
+	if e.isParent {
+		m.NavigateUp()
+		return true
+	}
+	m.navigateTo(e.path)
+	return true
+}
+
+// NavigateUp goes to the parent directory.
+func (m *BrowserModel) NavigateUp() {
+	parent := filepath.Dir(m.currentPath)
+	if parent != m.currentPath {
+		m.navigateTo(parent)
 	}
 }
 
-// MoveUp moves the cursor up, skipping headers.
+// MoveUp moves the cursor up, skipping headers and separators.
 func (m *BrowserModel) MoveUp() {
+	all := m.all()
 	for m.cursor > 0 {
 		m.cursor--
-		if !m.items[m.cursor].isHeader && m.items[m.cursor].path != "" {
+		e := all[m.cursor]
+		if !e.isHeader && !e.isSeparator {
 			return
 		}
 	}
 }
 
-// MoveDown moves the cursor down, skipping headers.
+// MoveDown moves the cursor down, skipping headers and separators.
 func (m *BrowserModel) MoveDown() {
-	for m.cursor < len(m.items)-1 {
+	all := m.all()
+	for m.cursor < len(all)-1 {
 		m.cursor++
-		if !m.items[m.cursor].isHeader && m.items[m.cursor].path != "" {
+		e := all[m.cursor]
+		if !e.isHeader && !e.isSeparator {
 			return
 		}
 	}
 }
 
-// SelectedItem returns the currently highlighted item (nil if header).
-func (m *BrowserModel) SelectedItem() *BrowserItem {
-	if m.cursor < 0 || m.cursor >= len(m.items) {
-		return nil
+// GotoHome navigates to the user's home directory.
+func (m *BrowserModel) GotoHome() {
+	if home, err := os.UserHomeDir(); err == nil {
+		m.navigateTo(home)
 	}
-	item := &m.items[m.cursor]
-	if item.isHeader || item.path == "" {
-		return nil
-	}
-	return item
 }
 
-// Select handles Enter/Space on the current item.
-// Returns (source, destinations, ready) — ready=true when a full transaction can be created.
+// GotoVolumes navigates to /Volumes.
+func (m *BrowserModel) GotoVolumes() {
+	m.navigateTo("/Volumes")
+}
+
+// current returns the entry at the cursor position.
+func (m *BrowserModel) current() (browserEntry, bool) {
+	all := m.all()
+	if m.cursor < 0 || m.cursor >= len(all) {
+		return browserEntry{}, false
+	}
+	return all[m.cursor], true
+}
+
+// ── Selection ─────────────────────────────────────────────────────────────────
+
+// Select handles [space] — picks source then destination.
+// Returns (source, dests, ready=true) when a complete transaction can be queued.
+// Files and directories are both valid sources; only directories are valid destinations.
 func (m *BrowserModel) Select() (source string, dests []string, ready bool) {
-	item := m.SelectedItem()
-	if item == nil {
+	e, ok := m.current()
+	if !ok || e.isHeader || e.isSeparator || e.isParent {
 		return
 	}
 
 	if !m.selectingDest {
-		// First selection: set as source.
-		m.selectedSource = item.path
+		// First selection: set as source (file OR directory).
+		m.selectedSource = e.path
 		m.selectingDest = true
 		return
 	}
 
-	// Second/third selection: add as destination.
-	// Don't allow selecting the same path as source.
-	if item.path == m.selectedSource {
-		return
+	// Second+ selection: destination must be a directory.
+	var target string
+	if e.isDir {
+		target = e.path
+	} else {
+		// File highlighted — use the directory we're browsing as destination.
+		target = m.currentPath
 	}
-	// Don't allow duplicate destinations.
+
+	if target == m.selectedSource {
+		return // can't use source as destination
+	}
 	for _, d := range m.selectedDests {
-		if d == item.path {
-			return
+		if d == target {
+			return // already added
 		}
 	}
+	m.selectedDests = append(m.selectedDests, target)
 
-	m.selectedDests = append(m.selectedDests, item.path)
-
-	// Allow up to 2 destinations; transaction is ready after at least 1.
+	// After the first destination is chosen the transaction is ready.
+	// A second [space] press on a different path would add a second destination,
+	// but we fire immediately after 1 to keep the flow fast.
 	if len(m.selectedDests) >= 1 {
-		// User can press Enter again to add a second destination, or [n] to confirm.
-		// For simplicity: first destination press triggers "ready".
 		src := m.selectedSource
 		ds := make([]string, len(m.selectedDests))
 		copy(ds, m.selectedDests)
@@ -177,13 +333,7 @@ func (m *BrowserModel) Select() (source string, dests []string, ready bool) {
 	return
 }
 
-// AddDestAndCheck adds a destination and checks if we should create the transaction.
-// Returns (dests, ready). If len(dests)==2, auto-ready.
-func (m *BrowserModel) AddDestAndCheck() ([]string, bool) {
-	return m.selectedDests, len(m.selectedDests) >= 2
-}
-
-// Reset clears the selection state.
+// Reset clears selection and eject state.
 func (m *BrowserModel) Reset() {
 	m.selectedSource = ""
 	m.selectingDest = false
@@ -192,148 +342,169 @@ func (m *BrowserModel) Reset() {
 	m.ejectTarget = ""
 }
 
-// StartEject marks a volume for eject confirmation.
+// StartEject marks the highlighted volume for eject confirmation.
 func (m *BrowserModel) StartEject() string {
-	item := m.SelectedItem()
-	if item == nil || !item.isVolume {
+	e, ok := m.current()
+	if !ok || !e.isVolume {
 		return ""
 	}
-	m.ejectTarget = item.path
+	m.ejectTarget = e.path
 	m.confirmEject = true
-	return item.path
+	return e.path
 }
 
-// ConfirmEject returns the eject target and clears confirmation state.
+// ConfirmEject clears the confirmation state and returns the target path.
 func (m *BrowserModel) ConfirmEject() string {
-	target := m.ejectTarget
+	t := m.ejectTarget
 	m.confirmEject = false
 	m.ejectTarget = ""
-	return target
+	return t
 }
 
-// View renders the browser panel.
-func (m BrowserModel) View() string {
-	if m.width == 0 {
-		return ""
-	}
+// ── View ──────────────────────────────────────────────────────────────────────
 
-	innerWidth := m.width - 4 // account for border + padding
-	if innerWidth < 1 {
-		innerWidth = 1
+func (m BrowserModel) View() string {
+	innerWidth := m.width - 4
+	if innerWidth < 8 {
+		innerWidth = 8
 	}
 
 	var lines []string
 
-	title := PanelTitleStyle.Render("FILE BROWSER")
-	lines = append(lines, title)
+	// Panel title + current path breadcrumb.
+	lines = append(lines, PanelTitleStyle.Render("FILE BROWSER"))
+	lines = append(lines, AmberStyle.Render(humanize.ShortPath(m.currentPath, innerWidth)))
 	lines = append(lines, DimStyle.Render(strings.Repeat("─", innerWidth)))
 
-	// Show selection hint.
-	if m.selectingDest {
-		hint := AmberStyle.Render(fmt.Sprintf("SOURCE: %s", humanize.ShortPath(m.selectedSource, innerWidth-9)))
-		lines = append(lines, hint)
-		lines = append(lines, MutedStyle.Render("Select destination(s), [esc] cancel"))
-		lines = append(lines, "")
-	}
-
-	// Show eject confirmation.
+	// Selection status bar.
 	if m.confirmEject {
-		lines = append(lines, RedStyle.Render("EJECT: "+humanize.ShortPath(m.ejectTarget, innerWidth-8)))
-		lines = append(lines, MutedStyle.Render("[y] confirm  [f] force  [esc] cancel"))
+		volName := humanize.ShortPath(m.ejectTarget, innerWidth-8)
+		if m.busyProcess != "" {
+			lines = append(lines, AmberStyle.Render("BUSY: "+m.busyProcess))
+			lines = append(lines, RedStyle.Render("EJECT: "+volName))
+			lines = append(lines, MutedStyle.Render("[f] force eject  [esc] cancel"))
+		} else {
+			lines = append(lines, RedStyle.Render("EJECT: "+volName))
+			lines = append(lines, MutedStyle.Render("[y] confirm  [f] force  [esc] cancel"))
+		}
+		lines = append(lines, "")
+	} else if m.selectingDest {
+		src := humanize.ShortPath(m.selectedSource, innerWidth-6)
+		lines = append(lines, AmberStyle.Render("SRC: "+src))
+		lines = append(lines, MutedStyle.Render("[space] set dest  [esc] cancel"))
+		lines = append(lines, "")
+	} else {
+		lines = append(lines, MutedStyle.Render("[space] select  [→] open  [←] back"))
 		lines = append(lines, "")
 	}
 
-	visibleRows := m.height - len(lines) - 3
+	headerLines := len(lines)
+	visibleRows := m.height - headerLines - 1
 	if visibleRows < 1 {
 		visibleRows = 1
 	}
 
-	// Scroll window.
-	start := 0
+	all := m.all()
+
+	// Compute scroll offset to keep cursor visible.
+	offset := 0
 	if m.cursor >= visibleRows {
-		start = m.cursor - visibleRows + 1
+		offset = m.cursor - visibleRows + 1
 	}
-	end := start + visibleRows
-	if end > len(m.items) {
-		end = len(m.items)
+	end := offset + visibleRows
+	if end > len(all) {
+		end = len(all)
 	}
 
-	for i := start; i < end; i++ {
-		item := m.items[i]
-		line := m.renderItem(item, i, innerWidth)
-		lines = append(lines, line)
+	if offset > 0 {
+		lines = append(lines, MutedStyle.Render(fmt.Sprintf(" ↑ %d more", offset)))
+	}
+
+	for i := offset; i < end; i++ {
+		lines = append(lines, m.renderEntry(all[i], i, innerWidth))
+	}
+
+	below := len(all) - end
+	if below > 0 {
+		lines = append(lines, MutedStyle.Render(fmt.Sprintf(" ↓ %d more", below)))
 	}
 
 	return strings.Join(lines, "\n")
 }
 
-// renderItem renders a single browser item.
-func (m BrowserModel) renderItem(item BrowserItem, idx int, width int) string {
-	if item.isHeader {
-		if item.label == "" {
-			return ""
-		}
-		return PanelTitleStyle.Render(item.label)
+func (m BrowserModel) renderEntry(e browserEntry, idx int, width int) string {
+	if e.isHeader {
+		return PanelTitleStyle.Render(e.name)
+	}
+	if e.isSeparator {
+		return DimStyle.Render(strings.Repeat("─", width))
 	}
 
 	selected := idx == m.cursor
-	isSource := item.path == m.selectedSource
+	isSource := e.path != "" && e.path == m.selectedSource
 	isDest := false
 	for _, d := range m.selectedDests {
-		if d == item.path {
+		if d == e.path {
 			isDest = true
 			break
 		}
 	}
 
-	// Build label.
-	prefix := "  "
-	if item.isCameraCard {
-		prefix = "  [C] "
-	} else if item.isVolume {
-		prefix = "  [D] "
-	} else {
-		prefix = "  ~/  "
+	// Build icon + label.
+	var icon string
+	switch {
+	case e.isParent:
+		icon = "↑ "
+	case e.isCameraCard:
+		icon = "[C] "
+	case e.isVolume:
+		icon = "[D] "
+	case e.isBookmark && e.isDir:
+		icon = "  ~ "
+	case e.isDir:
+		icon = "  ▸ "
+	default:
+		icon = "    "
 	}
 
-	label := item.label
-	maxLabelWidth := width - len(prefix) - 1
-	if len(label) > maxLabelWidth {
-		label = label[:maxLabelWidth]
+	label := icon + e.name
+	if e.isDir && !e.isParent {
+		label += "/"
+	}
+	if len(label) > width-1 {
+		label = label[:width-1]
 	}
 
-	// Free space indicator (for volumes).
-	var freeStr string
-	if item.isVolume && item.freeBytes > 0 {
-		freeStr = MutedStyle.Render(" " + humanize.Bytes(item.freeBytes))
+	// Right-side annotation (free space for volumes).
+	annotation := ""
+	if e.isVolume && e.freeBytes > 0 {
+		annotation = MutedStyle.Render("  " + humanize.Bytes(e.freeBytes))
 	}
 
-	row := prefix + label
-
+	// Choose row style.
 	var style lipgloss.Style
 	switch {
 	case isSource:
+		icon = "→ "
+		plain := strings.TrimLeft(label, " ↑▸[CDM~] ")
+		label = icon + plain
 		style = lipgloss.NewStyle().Foreground(ColorAmber).Bold(true)
-		row = "→ " + row[2:] // replace prefix with arrow
 	case isDest:
-		style = lipgloss.NewStyle().Foreground(ColorGreen)
-		row = "✓ " + row[2:]
+		icon = "✓ "
+		plain := strings.TrimLeft(label, " ↑▸[CDM~] ")
+		label = icon + plain
+		style = lipgloss.NewStyle().Foreground(ColorGreen).Bold(true)
+	case selected && e.isDir:
+		style = ActiveItemStyle
 	case selected:
 		style = SelectedItemStyle
-	default:
+	case e.isParent:
+		style = MutedStyle
+	case e.isDir:
 		style = lipgloss.NewStyle().Foreground(ColorText)
+	default:
+		style = DimStyle // files are secondary
 	}
 
-	rendered := style.Render(row)
-	if item.isVolume && freeStr != "" {
-		rendered += freeStr
-	}
-	return rendered
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	return style.Render(label) + annotation
 }
