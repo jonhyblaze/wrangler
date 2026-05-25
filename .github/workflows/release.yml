@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run tests
+        run: go test ./...
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin_amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin_arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build \
+            -ldflags="-X main.version=${{ github.ref_name }}" \
+            -o wrangler \
+            ./
+
+      - name: Create archive
+        run: |
+          ARCHIVE="wrangler_${{ github.ref_name }}_${{ matrix.suffix }}.tar.gz"
+          tar czf "$ARCHIVE" wrangler README.md
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Compute checksum
+        run: shasum -a 256 "${{ env.ARCHIVE }}" >> checksums.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrangler-${{ matrix.suffix }}
+          path: |
+            ${{ env.ARCHIVE }}
+            checksums.txt
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Merge checksums
+        run: cat dist/checksums.txt > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Wrangler ${{ github.ref_name }}
+          body: |
+            ## Install
+
+            **Homebrew:**
+            ```bash
+            brew tap jonhyblaze/wrangler
+            brew install wrangler
+            ```
+
+            **curl:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/jonhyblaze/wrangler/main/install.sh | sh
+            ```
+
+            See [README.md](https://github.com/jonhyblaze/wrangler/blob/main/README.md) for full documentation.
+          files: |
+            dist/*.tar.gz
+            checksums.txt
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
