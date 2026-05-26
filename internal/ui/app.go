@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jonhyblaze/wrangler/internal/media"
+	"github.com/jonhyblaze/wrangler/internal/meta"
 	"github.com/jonhyblaze/wrangler/internal/report"
 	"github.com/jonhyblaze/wrangler/internal/transaction"
 )
@@ -44,6 +45,10 @@ type AppModel struct {
 
 	// Rsync unavailable warning.
 	rsyncWarning string
+
+	// Info popup overlay.
+	showInfoPopup bool
+	infoPopup     InfoPopupModel
 }
 
 // NewApp creates the root AppModel.
@@ -189,6 +194,29 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	// Info popup messages.
+	case meta.LoadedMsg:
+		if m.showInfoPopup && msg.Path == m.infoPopup.path {
+			m.infoPopup.info = msg.M
+			m.infoPopup.loading = false
+		}
+		return m, nil
+
+	case meta.SpinTickMsg:
+		if m.showInfoPopup && m.infoPopup.loading && msg.Path == m.infoPopup.path {
+			m.infoPopup.spinFrame++
+			return m, SpinCmd(msg.Path)
+		}
+		return m, nil
+
+	case InfoCopiedMsg:
+		m.infoPopup.copiedKey = msg.Key
+		return m, copyClearCmd()
+
+	case InfoCopiedClearMsg:
+		m.infoPopup.copiedKey = ""
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -198,6 +226,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey processes key events.
 func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// When the info popup is open, route all keys there.
+	if m.showInfoPopup {
+		return m.handleInfoPopupKey(msg)
+	}
+
 	// Global keys.
 	switch {
 	case key.Matches(msg, m.keys.Quit):
@@ -291,6 +324,15 @@ func (m AppModel) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case key.Matches(msg, m.keys.Info):
+		e, ok := m.browser.current()
+		if ok && e.path != "" && !e.isHeader && !e.isSeparator {
+			var cmd tea.Cmd
+			m.infoPopup, cmd = NewInfoPopup(e.path)
+			m.showInfoPopup = true
+			return m, cmd
+		}
+
 	case key.Matches(msg, m.keys.Select):
 		// Space = select highlighted item as source then destination.
 		src, dests, ready := m.browser.Select()
@@ -300,6 +342,60 @@ func (m AppModel) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_ = src // partial selection in progress
 	}
 
+	return m, nil
+}
+
+// handleInfoPopupKey handles key events when the info popup is visible.
+func (m AppModel) handleInfoPopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "i":
+		m.showInfoPopup = false
+		return m, nil
+
+	case "s":
+		// Set highlighted path as source and continue to destination selection.
+		if m.infoPopup.info != nil && !m.infoPopup.info.NotFound {
+			m.browser.selectedSource = m.infoPopup.info.Path
+			m.browser.selectingDest = true
+		}
+		m.showInfoPopup = false
+		return m, nil
+
+	case "d":
+		// Add path as destination (only valid while choosing a destination).
+		if m.infoPopup.info != nil && !m.infoPopup.info.NotFound && m.browser.selectingDest {
+			p := m.infoPopup.info.Path
+			// Deduplicate.
+			dup := false
+			for _, d := range m.browser.selectedDests {
+				if d == p {
+					dup = true
+					break
+				}
+			}
+			if !dup && p != m.browser.selectedSource {
+				m.browser.selectedDests = append(m.browser.selectedDests, p)
+			}
+		}
+		m.showInfoPopup = false
+		return m, nil
+
+	case "c":
+		if m.infoPopup.info != nil && !m.infoPopup.info.NotFound {
+			return m, copyCmd("path", m.infoPopup.info.Path)
+		}
+
+	case "b":
+		if m.infoPopup.info != nil && !m.infoPopup.info.NotFound {
+			bc := meta.Breadcrumb(m.infoPopup.info.Path, 500)
+			return m, copyCmd("breadcrumb", bc)
+		}
+
+	case "m":
+		if m.infoPopup.info != nil && !m.infoPopup.info.NotFound {
+			return m, copyCmd("meta", metaAsText(m.infoPopup.info))
+		}
+	}
 	return m, nil
 }
 
@@ -421,6 +517,12 @@ func (m *AppModel) advanceQueue() tea.Cmd {
 func (m AppModel) View() string {
 	if m.width == 0 {
 		return "Loading..."
+	}
+
+	// Info popup overlays the entire screen.
+	if m.showInfoPopup {
+		popup := m.infoPopup.View()
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, popup)
 	}
 
 	header := m.renderHeader()
@@ -559,6 +661,7 @@ func (m AppModel) renderFooter() string {
 			parts = append(parts, MutedStyle.Render("[space]")+" set source")
 			parts = append(parts, MutedStyle.Render("[→/enter]")+" open dir")
 			parts = append(parts, MutedStyle.Render("[←/bksp]")+" parent")
+			parts = append(parts, MutedStyle.Render("[i]")+" info")
 			parts = append(parts, MutedStyle.Render("[~]")+" home")
 			parts = append(parts, MutedStyle.Render("[v]")+" /Volumes")
 			parts = append(parts, MutedStyle.Render("[e]")+" eject")

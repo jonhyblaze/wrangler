@@ -24,6 +24,8 @@ type KeyMap struct {
 	Cancel     key.Binding
 	Verify     key.Binding
 	OpenReport key.Binding
+	// Info popup
+	Info key.Binding
 	// Confirmations
 	Confirm    key.Binding
 	Back       key.Binding
@@ -92,6 +94,10 @@ func DefaultKeyMap() KeyMap {
 		OpenReport: key.NewBinding(
 			key.WithKeys("r"),
 			key.WithHelp("[r]", "open report"),
+		),
+		Info: key.NewBinding(
+			key.WithKeys("i"),
+			key.WithHelp("[i]", "info"),
 		),
 		Confirm: key.NewBinding(
 			key.WithKeys("y"),
