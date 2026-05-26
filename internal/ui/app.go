@@ -697,8 +697,8 @@ func (m AppModel) renderFooter() string {
 // panelWidths returns the widths of the three panels.
 func (m AppModel) panelWidths() (browser, detail, queue int) {
 	total := m.width
-	browser = total * 22 / 100
-	queue = total * 28 / 100
+	browser = total * 30 / 100
+	queue = total * 35 / 100
 	detail = total - browser - queue
 
 	if browser < 20 {
