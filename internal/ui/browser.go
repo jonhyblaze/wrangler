@@ -227,14 +227,44 @@ func (m *BrowserModel) NavigateInto() bool {
 		return true
 	}
 	m.navigateTo(e.path)
+	// Always land in the directory listing (bottom section) after navigating
+	// into any folder, whether from a bookmark/card or a child directory.
+	m.jumpToFirstDirEntry()
 	return true
 }
 
-// NavigateUp goes to the parent directory.
+// firstDirEntryIdx returns the index of the first selectable entry in the
+// bottom (directory listing) section — the first entry after the separator.
+// Returns -1 if the section is empty.
+func (m *BrowserModel) firstDirEntryIdx() int {
+	all := m.all()
+	pastSep := false
+	for i, e := range all {
+		if e.isSeparator {
+			pastSep = true
+			continue
+		}
+		if pastSep && !e.isHeader && !e.isSeparator {
+			return i
+		}
+	}
+	return -1
+}
+
+// jumpToFirstDirEntry positions the cursor on the first selectable entry in
+// the bottom section (actual directory listing).
+func (m *BrowserModel) jumpToFirstDirEntry() {
+	if idx := m.firstDirEntryIdx(); idx >= 0 {
+		m.cursor = idx
+	}
+}
+
+// NavigateUp goes to the parent directory, landing in the bottom section.
 func (m *BrowserModel) NavigateUp() {
 	parent := filepath.Dir(m.currentPath)
 	if parent != m.currentPath {
 		m.navigateTo(parent)
+		m.jumpToFirstDirEntry()
 	}
 }
 
@@ -262,16 +292,18 @@ func (m *BrowserModel) MoveDown() {
 	}
 }
 
-// GotoHome navigates to the user's home directory.
+// GotoHome navigates to the user's home directory, landing in the bottom section.
 func (m *BrowserModel) GotoHome() {
 	if home, err := os.UserHomeDir(); err == nil {
 		m.navigateTo(home)
+		m.jumpToFirstDirEntry()
 	}
 }
 
-// GotoVolumes navigates to /Volumes.
+// GotoVolumes navigates to /Volumes, landing in the bottom section.
 func (m *BrowserModel) GotoVolumes() {
 	m.navigateTo("/Volumes")
+	m.jumpToFirstDirEntry()
 }
 
 // current returns the entry at the cursor position.
