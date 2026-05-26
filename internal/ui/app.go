@@ -609,48 +609,88 @@ func (m AppModel) View() string {
 }
 
 // renderHeader renders the top header bar.
+//
+// Fixed two-row layout — height never changes regardless of state:
+//
+//	Row 1: DATA WRANGLER  ████████████░░░░░░░░  72%
+//	Row 2: status / log line (empty when idle)
 func (m AppModel) renderHeader() string {
-	left := lipgloss.NewStyle().
-		Foreground(ColorAmber).
-		Bold(true).
-		Render("WRANGLER")
+	bg := ColorSurface
 
-	// Show active transaction summary if one is running.
-	right := ""
+	// Inner content width (HeaderStyle has Padding(0,1) → 1 char each side).
+	innerW := m.width - 2
+	if innerW < 4 {
+		innerW = 4
+	}
+
+	// ── Row 1: title + progress bar ─────────────────────────────────────────
+	title := lipgloss.NewStyle().
+		Foreground(ColorAmber).Bold(true).Background(bg).
+		Render("DATA WRANGLER")
+
+	titleW := lipgloss.Width(title)
+
+	// Look for an active / verifying transaction to show a progress bar.
+	var activePct float64
+	hasActive := false
 	for _, tx := range m.transactions {
 		snap := tx.Snapshot()
 		if snap.State == transaction.StateRunning || snap.State == transaction.StateVerifying {
-			pct := snap.Progress.Percent()
-			bar := lipgloss.NewStyle().Foreground(ColorAmber).
-				Render(humanize_bar(pct, 8))
-			right = fmt.Sprintf("%s %s %.0f%%", snap.ID, bar, pct*100)
+			activePct = snap.Progress.Percent()
+			hasActive = true
 			break
 		}
 	}
 
+	pctLabel := ""
+	pctW := 0
+	barW := 0
+	if hasActive {
+		pctLabel = fmt.Sprintf("%3.0f%%", activePct*100)
+		pctW = len(pctLabel) + 1 // 1 leading space
+		// Bar fills the space between title and percentage label.
+		// 2 spaces padding on each side of the bar.
+		barW = innerW - titleW - pctW - 4
+		if barW < 1 {
+			barW = 1
+		}
+	}
+
+	var row1 string
+	if hasActive {
+		bar := lipgloss.NewStyle().Foreground(ColorAmber).Background(bg).
+			Render(humanize_bar(activePct, barW))
+		pct := lipgloss.NewStyle().Foreground(ColorMuted).Background(bg).
+			Render(" " + pctLabel)
+		pad := lipgloss.NewStyle().Background(bg).Render("  ")
+		// Fill remaining space so the row background is solid.
+		gap := innerW - titleW - barW - lipgloss.Width(pct) - 4
+		if gap < 0 {
+			gap = 0
+		}
+		filler := lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", gap))
+		row1 = title + pad + bar + pad + pct + filler
+	} else {
+		// No active transaction — title only, rest filled with bg.
+		rest := innerW - titleW
+		if rest < 0 {
+			rest = 0
+		}
+		row1 = title + lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", rest))
+	}
+
+	// ── Row 2: status / log line (always exactly one row) ───────────────────
+	var statusContent string
 	if m.statusMsg != "" {
-		// statusMsg may already contain Lipgloss-rendered strings (e.g. colored ✓/✗).
-		// Use it directly so colour codes don't get double-rendered.
-		right = m.statusMsg
+		// statusMsg may already contain ANSI colour codes — render as-is but
+		// ensure the full row has the surface background.
+		statusContent = m.statusMsg
 	}
+	row2 := lipgloss.NewStyle().
+		Background(bg).Width(innerW).
+		Render(statusContent)
 
-	// Inner content width = outer (m.width) minus 1-char padding each side.
-	innerW := m.width - 2
-	if innerW < 2 {
-		innerW = 2
-	}
-
-	gap := innerW - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
-
-	titleRow := left + strings.Repeat(" ", gap) + right
-	// Separator gives the header a visible second row — the same look that the
-	// previous (accidental) text-wrap produced.
-	sepRow := DimStyle.Render(strings.Repeat("─", innerW))
-
-	return HeaderStyle.Width(m.width).Render(titleRow + "\n" + sepRow)
+	return HeaderStyle.Width(m.width).Render(row1 + "\n" + row2)
 }
 
 // renderFooter renders the bottom keybinding footer.
