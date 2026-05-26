@@ -156,18 +156,30 @@ func (m DetailModel) renderVerifying(snap transaction.TxSnapshot, width int) str
 	lines = append(lines, "")
 	lines = append(lines, m.renderSourceDest(snap, width)...)
 	lines = append(lines, "")
-	lines = append(lines, MutedStyle.Render("Running xxHash verification pass..."))
 
-	if snap.Verify.FilesTotal > 0 {
+	barWidth := width - 2
+
+	switch {
+	case snap.Verify.FilesTotal > 0:
+		// Destination verification phase — total is known, show percentage bar.
 		pct := float64(snap.Verify.FilesChecked) / float64(snap.Verify.FilesTotal)
-		barWidth := width - 2
 		bar := humanize.ProgressBar(pct, barWidth)
 		lines = append(lines, lipgloss.NewStyle().Foreground(ColorGreen).Render(bar))
-		lines = append(lines, fmt.Sprintf("%s / %s files verified",
+		lines = append(lines, fmt.Sprintf("%.0f%%  %s / %s files",
+			pct*100,
 			humanize.Comma(snap.Verify.FilesChecked),
 			humanize.Comma(snap.Verify.FilesTotal),
 		))
+	case snap.Verify.FilesChecked > 0:
+		// Source hashing phase — total not yet known, show scanned count.
+		lines = append(lines, MutedStyle.Render("Hashing source…"))
+		lines = append(lines, fmt.Sprintf("%s files scanned",
+			humanize.Comma(snap.Verify.FilesChecked),
+		))
+	default:
+		lines = append(lines, MutedStyle.Render("Running xxHash verification…"))
 	}
+
 	return strings.Join(lines, "\n")
 }
 

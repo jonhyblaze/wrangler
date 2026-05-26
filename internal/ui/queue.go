@@ -148,35 +148,39 @@ func (m QueueModel) renderRow(snap transaction.TxSnapshot, idx int, width int) s
 	idPart := fmt.Sprintf("%s  %s ", snap.ID, icon)
 	statePart := snap.State.String()
 
-	// For active/verifying states, show compact progress.
+	// For active/verifying states replace the state label with compact progress.
 	extraPart := ""
 	if snap.State == transaction.StateRunning || snap.State == transaction.StatePaused {
 		pct := snap.Progress.Percent()
-		bar := humanize.ProgressBar(pct, 10)
+		bar := humanize.ProgressBar(pct, 8)
 		barColored := lipgloss.NewStyle().Foreground(color).Render(bar)
 		extraPart = " " + barColored + fmt.Sprintf(" %.0f%%", pct*100)
 		statePart = ""
 	} else if snap.State == transaction.StateVerifying {
 		if snap.Verify.FilesTotal > 0 {
+			// Destination verification phase — show percentage.
 			pct := float64(snap.Verify.FilesChecked) / float64(snap.Verify.FilesTotal)
-			bar := humanize.ProgressBar(pct, 10)
+			bar := humanize.ProgressBar(pct, 8)
 			barColored := lipgloss.NewStyle().Foreground(color).Render(bar)
-			extraPart = " " + barColored
+			extraPart = " " + barColored + fmt.Sprintf(" %.0f%%", pct*100)
+		} else if snap.Verify.FilesChecked > 0 {
+			// Source hashing phase — total unknown yet, show count.
+			extraPart = fmt.Sprintf(" %s files", humanize.Comma(snap.Verify.FilesChecked))
 		}
 		statePart = ""
 	}
 
 	stateRendered := stateStyle.Render(statePart)
-	row := prefix + idPart + stateRendered + extraPart
 
-	// Truncate if too long.
-	// Note: ANSI escape codes inflate len(), but for display purposes this is approximate.
-	if len(row) > width+10 { // rough threshold accounting for escape codes
-		row = row[:width+10]
-	}
-
+	var row string
 	if isCursor {
-		return SelectedItemStyle.Render(prefix) + stateStyle.Render(idPart) + stateRendered + extraPart
+		row = SelectedItemStyle.Render(prefix) + stateStyle.Render(idPart) + stateRendered + extraPart
+	} else {
+		row = prefix + idPart + stateRendered + extraPart
 	}
-	return row
+
+	// MaxWidth truncates correctly — it uses ansi.Truncate internally which
+	// respects multi-byte runes (e.g. █ ░) and ANSI escape codes, unlike the
+	// previous raw byte-slice which could corrupt progress-bar characters.
+	return lipgloss.NewStyle().MaxWidth(width).Render(row)
 }
