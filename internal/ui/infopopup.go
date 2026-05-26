@@ -17,8 +17,8 @@ const (
 	// popupOuterW is the total outer width of the popup (border + padding + content).
 	// With 1-char border each side and 1-char padding each side:
 	//   inner content width = popupOuterW - 2 (border) - 2 (padding) = popupInnerW
-	popupOuterW = 50
-	popupInnerW = 46 // popupOuterW - 4
+	popupOuterW = 72
+	popupInnerW = 64 // popupOuterW - 4
 	popupLabelW = 12
 )
 
@@ -72,9 +72,9 @@ func copyCmd(key, text string) tea.Cmd {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 var popupStyle = lipgloss.NewStyle().
-	Border(lipgloss.RoundedBorder()).
+	Border(lipgloss.NormalBorder()).
 	BorderForeground(ColorAmber).
-	Padding(0, 1).
+	Padding(1, 2).
 	Background(ColorSurface)
 
 // View renders the popup box.
