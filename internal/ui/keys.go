@@ -14,8 +14,10 @@ type KeyMap struct {
 	NavigateUp   key.Binding // ← / Backspace — go to parent directory
 	Select       key.Binding // Space — select highlighted dir as source/dest
 	// List movement
-	Up   key.Binding
-	Down key.Binding
+	Up       key.Binding
+	Down     key.Binding
+	PageUp   key.Binding
+	PageDown key.Binding
 	// Quick-jump keys (browser)
 	GotoHome    key.Binding
 	GotoVolumes key.Binding
@@ -70,6 +72,14 @@ func DefaultKeyMap() KeyMap {
 		Down: key.NewBinding(
 			key.WithKeys("down", "j"),
 			key.WithHelp("[↓/j]", "down"),
+		),
+		PageUp: key.NewBinding(
+			key.WithKeys("pgup", "shift+up"),
+			key.WithHelp("[pgup/shift+↑]", "page up"),
+		),
+		PageDown: key.NewBinding(
+			key.WithKeys("pgdown", "shift+down"),
+			key.WithHelp("[pgdn/shift+↓]", "page down"),
 		),
 		GotoHome: key.NewBinding(
 			key.WithKeys("~"),

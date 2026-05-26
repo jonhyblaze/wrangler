@@ -294,6 +294,12 @@ func (m AppModel) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Down):
 		m.browser.MoveDown()
 
+	case key.Matches(msg, m.keys.PageUp):
+		m.browser.PageUp()
+
+	case key.Matches(msg, m.keys.PageDown):
+		m.browser.PageDown()
+
 	case key.Matches(msg, m.keys.NavigateInto):
 		m.browser.NavigateInto()
 
@@ -539,17 +545,24 @@ func (m AppModel) View() string {
 	bw, dw, qw := m.panelWidths()
 
 	// Set heights on sub-models.
+	// contentH - 2: the Lipgloss panel Height is the inner content area; the
+	// two border rows are added on top, so sub-models must not exceed contentH-2.
+	innerH := contentH - 2
+	if innerH < 1 {
+		innerH = 1
+	}
+
 	bm := m.browser
 	bm.width = bw
-	bm.height = contentH
+	bm.height = innerH
 
 	dm := m.detail
 	dm.width = dw
-	dm.height = contentH
+	dm.height = innerH
 
 	qm := m.queue
 	qm.width = qw
-	qm.height = contentH
+	qm.height = innerH
 
 	// Render panels with borders.
 	// In Lipgloss v1.x Width/Height are the total outer dimensions (border +

@@ -292,6 +292,32 @@ func (m *BrowserModel) MoveDown() {
 	}
 }
 
+const pageSize = 16
+
+// PageDown moves the cursor forward by up to pageSize selectable entries.
+func (m *BrowserModel) PageDown() {
+	all := m.all()
+	moved := 0
+	for m.cursor < len(all)-1 && moved < pageSize {
+		m.cursor++
+		if !all[m.cursor].isHeader && !all[m.cursor].isSeparator {
+			moved++
+		}
+	}
+}
+
+// PageUp moves the cursor backward by up to pageSize selectable entries.
+func (m *BrowserModel) PageUp() {
+	all := m.all()
+	moved := 0
+	for m.cursor > 0 && moved < pageSize {
+		m.cursor--
+		if !all[m.cursor].isHeader && !all[m.cursor].isSeparator {
+			moved++
+		}
+	}
+}
+
 // GotoHome navigates to the user's home directory, landing in the bottom section.
 func (m *BrowserModel) GotoHome() {
 	if home, err := os.UserHomeDir(); err == nil {
@@ -431,7 +457,9 @@ func (m BrowserModel) View() string {
 	}
 
 	headerLines := len(lines)
-	visibleRows := m.height - headerLines - 1
+	// Reserve 2 rows for the ↑/↓ scroll indicators so they don't push content
+	// past the panel boundary (matches queue panel behaviour).
+	visibleRows := m.height - headerLines - 2
 	if visibleRows < 1 {
 		visibleRows = 1
 	}
@@ -459,6 +487,12 @@ func (m BrowserModel) View() string {
 	below := len(all) - end
 	if below > 0 {
 		lines = append(lines, MutedStyle.Render(fmt.Sprintf(" ↓ %d more", below)))
+	}
+
+	// Hard clamp: unconditionally cap at the available inner panel height so the
+	// panel can never grow regardless of how many entries the directory contains.
+	if m.height > 0 && len(lines) > m.height {
+		lines = lines[:m.height]
 	}
 
 	return strings.Join(lines, "\n")
