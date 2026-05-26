@@ -688,7 +688,7 @@ func (m AppModel) renderFooter() string {
 		parts = append(parts, MutedStyle.Render("[n]")+" new")
 	}
 
-	parts = append(parts, MutedStyle.Render("[q]")+" quit")
+	parts = append(parts, MutedStyle.Render("[q]")+" quit ")
 
 	footer := strings.Join(parts, "  ")
 	return FooterStyle.Width(m.width).Render(footer)
