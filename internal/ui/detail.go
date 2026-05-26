@@ -13,9 +13,10 @@ import (
 
 // DetailModel is the transaction detail panel state.
 type DetailModel struct {
-	tx     *transaction.Transaction
-	width  int
-	height int
+	tx              *transaction.Transaction
+	width           int
+	height          int
+	priorityPausedID string // ID of the paused-for-priority tx (shown in its detail view)
 }
 
 // NewDetail creates a new DetailModel.
@@ -26,6 +27,12 @@ func NewDetail() DetailModel {
 // SetTransaction sets the transaction to display.
 func (m *DetailModel) SetTransaction(tx *transaction.Transaction) {
 	m.tx = tx
+}
+
+// SetPriorityPausedID records the ID of the transaction that is paused for
+// priority resumption so the detail view can annotate it. Pass "" to clear.
+func (m *DetailModel) SetPriorityPausedID(id string) {
+	m.priorityPausedID = id
 }
 
 // View renders the detail panel.
@@ -82,7 +89,7 @@ func (m DetailModel) renderQueued(snap transaction.TxSnapshot, width int) string
 	lines = append(lines, "")
 	lines = append(lines, m.renderSourceDest(snap, width)...)
 	lines = append(lines, "")
-	lines = append(lines, MutedStyle.Render("[c] cancel"))
+	lines = append(lines, MutedStyle.Render("[s] start  [c] cancel"))
 	return strings.Join(lines, "\n")
 }
 
@@ -123,11 +130,18 @@ func (m DetailModel) renderRunning(snap transaction.TxSnapshot, width int) strin
 }
 
 func (m DetailModel) renderPaused(snap transaction.TxSnapshot, width int) string {
+	isPriorityPaused := snap.ID == m.priorityPausedID && m.priorityPausedID != ""
+
 	var lines []string
 	lines = append(lines, PanelTitleStyle.Render("TRANSACTION DETAIL"))
 	lines = append(lines, DimStyle.Render(strings.Repeat("─", width)))
 	lines = append(lines, "")
-	lines = append(lines, WhiteStyle.Render(snap.ID+"  ⏸ PAUSED"))
+
+	title := snap.ID + "  ⏸ PAUSED"
+	if isPriorityPaused {
+		title += "  " + MutedStyle.Render("↩ auto-resume pending")
+	}
+	lines = append(lines, WhiteStyle.Render(title))
 	lines = append(lines, "")
 	lines = append(lines, m.renderSourceDest(snap, width)...)
 	lines = append(lines, "")
@@ -143,7 +157,11 @@ func (m DetailModel) renderPaused(snap transaction.TxSnapshot, width int) string
 		humanize.Comma(snap.Progress.FilesTotal),
 	))
 	lines = append(lines, "")
-	lines = append(lines, MutedStyle.Render("[p] resume  [c] cancel"))
+	if isPriorityPaused {
+		lines = append(lines, MutedStyle.Render("[c] cancel"))
+	} else {
+		lines = append(lines, MutedStyle.Render("[p] resume  [c] cancel"))
+	}
 	return strings.Join(lines, "\n")
 }
 

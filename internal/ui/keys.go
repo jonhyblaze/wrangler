@@ -22,10 +22,11 @@ type KeyMap struct {
 	GotoHome    key.Binding
 	GotoVolumes key.Binding
 	// Transaction controls
-	Pause      key.Binding
-	Cancel     key.Binding
-	Verify     key.Binding
-	OpenReport key.Binding
+	Pause         key.Binding
+	Cancel        key.Binding
+	Verify        key.Binding
+	OpenReport    key.Binding
+	StartPriority key.Binding // queue panel: force-start selected queued tx
 	// Info popup
 	Info key.Binding
 	// Confirmations
@@ -104,6 +105,10 @@ func DefaultKeyMap() KeyMap {
 		OpenReport: key.NewBinding(
 			key.WithKeys("r"),
 			key.WithHelp("[r]", "open report"),
+		),
+		StartPriority: key.NewBinding(
+			key.WithKeys("s"),
+			key.WithHelp("[s]", "start"),
 		),
 		Info: key.NewBinding(
 			key.WithKeys("i"),

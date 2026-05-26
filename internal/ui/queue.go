@@ -17,12 +17,13 @@ type FocusTransactionMsg struct {
 
 // QueueModel is the transaction queue panel state.
 type QueueModel struct {
-	transactions []*transaction.Transaction
-	cursor       int
-	offset       int
-	width        int
-	height       int
-	focusedIndex int // index of the transaction shown in the detail panel
+	transactions      []*transaction.Transaction
+	cursor            int
+	offset            int
+	width             int
+	height            int
+	focusedIndex      int    // index of the transaction shown in the detail panel
+	priorityPausedID  string // ID of the transaction paused for priority-start (auto-resume pending)
 }
 
 // NewQueue creates a new QueueModel.
@@ -65,6 +66,12 @@ func (m *QueueModel) SelectedTx() *transaction.Transaction {
 		return nil
 	}
 	return m.transactions[m.cursor]
+}
+
+// SetPriorityPausedID records the ID of the transaction that was paused to
+// make room for a priority start. Pass "" to clear.
+func (m *QueueModel) SetPriorityPausedID(id string) {
+	m.priorityPausedID = id
 }
 
 // View renders the queue panel.
@@ -123,6 +130,28 @@ func (m QueueModel) View() string {
 		lines = append(lines, MutedStyle.Render(fmt.Sprintf("  ↓ %d more", below)))
 	}
 
+	// Contextual action hint for the highlighted transaction.
+	if m.cursor >= 0 && m.cursor < len(m.transactions) {
+		snap := m.transactions[m.cursor].Snapshot()
+		var hint string
+		switch snap.State {
+		case transaction.StateQueued:
+			hint = "[s] start  [c] cancel"
+		case transaction.StateRunning:
+			hint = "[p] pause  [c] cancel"
+		case transaction.StatePaused:
+			if snap.ID == m.priorityPausedID {
+				hint = "[c] cancel"
+			} else {
+				hint = "[p] resume  [c] cancel"
+			}
+		}
+		if hint != "" {
+			lines = append(lines, "")
+			lines = append(lines, MutedStyle.Render(hint))
+		}
+	}
+
 	return strings.Join(lines, "\n")
 }
 
@@ -130,6 +159,7 @@ func (m QueueModel) View() string {
 func (m QueueModel) renderRow(snap transaction.TxSnapshot, idx int, width int) string {
 	isCursor := idx == m.cursor
 	isFocused := idx == m.focusedIndex
+	isPriorityPaused := snap.ID == m.priorityPausedID && m.priorityPausedID != ""
 
 	color := StateColor(snap.State)
 	icon := snap.State.Icon()
@@ -156,6 +186,10 @@ func (m QueueModel) renderRow(snap transaction.TxSnapshot, idx int, width int) s
 		barColored := lipgloss.NewStyle().Foreground(color).Render(bar)
 		extraPart = " " + barColored + fmt.Sprintf(" %.0f%%", pct*100)
 		statePart = ""
+		// If this is the priority-paused transaction, append a resuming badge.
+		if isPriorityPaused {
+			extraPart += MutedStyle.Render(" ↩")
+		}
 	} else if snap.State == transaction.StateVerifying {
 		if snap.Verify.FilesTotal > 0 {
 			// Destination verification phase — show percentage.
