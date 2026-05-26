@@ -421,6 +421,12 @@ func (r *Runner) Cancel() {
 	r.tx.SetStateForce(StateCancelled)
 }
 
+// TxID returns the ID of the transaction this runner is processing.
+// Used by the UI to distinguish active-runner messages from orphaned ones.
+func (r *Runner) TxID() string {
+	return r.tx.ID
+}
+
 // NextProgressMsg returns a tea.Cmd that delivers the next progress or done event.
 func (r *Runner) NextProgressMsg() tea.Cmd {
 	return func() tea.Msg {

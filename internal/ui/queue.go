@@ -140,11 +140,8 @@ func (m QueueModel) View() string {
 		case transaction.StateRunning:
 			hint = "[p] pause  [c] cancel"
 		case transaction.StatePaused:
-			if snap.ID == m.priorityPausedID {
-				hint = "[c] cancel"
-			} else {
-				hint = "[p] resume  [c] cancel"
-			}
+			// Both normally-paused and priority-paused support [p] resume/swap.
+			hint = "[p] resume  [c] cancel"
 		}
 		if hint != "" {
 			lines = append(lines, "")
@@ -210,7 +207,12 @@ func (m QueueModel) renderRow(snap transaction.TxSnapshot, idx int, width int) s
 	if isCursor {
 		row = SelectedItemStyle.Render(prefix) + stateStyle.Render(idPart) + stateRendered + extraPart
 	} else {
-		row = prefix + idPart + stateRendered + extraPart
+		// Apply state colour to the ID + icon so the state is immediately
+		// visible on every row, not just the cursor row. Without this the icon
+		// (⏸ vs ↓) and the ID text are all rendered in the plain terminal
+		// foreground colour, making a paused-at-0% row visually identical to
+		// a running-at-0% row.
+		row = prefix + stateStyle.Render(idPart) + stateRendered + extraPart
 	}
 
 	// MaxWidth truncates correctly — it uses ansi.Truncate internally which

@@ -216,19 +216,41 @@ func (v *Verifier) hashPath(
 	return hashes, count, err
 }
 
+// TxID returns the ID of the transaction this verifier is processing.
+// Used by the UI to guard stale VerifyProgressMsg heartbeats.
+func (v *Verifier) TxID() string {
+	return v.tx.ID
+}
+
 // NextVerifyMsg returns a tea.Cmd that waits for the next verification progress or result.
 func (v *Verifier) NextVerifyMsg() tea.Cmd {
 	return func() tea.Msg {
 		select {
 		case msg, ok := <-v.progressCh:
 			if !ok {
-				return nil
+				// Channel closed — send a heartbeat so the UI loop stays alive
+				// until VerifyDoneMsg arrives via resultCh.
+				snap := v.tx.Snapshot()
+				return VerifyProgressMsg{
+					TxID:    v.tx.ID,
+					Checked: snap.Verify.FilesChecked,
+					Total:   snap.Verify.FilesTotal,
+				}
 			}
 			return msg
 		case result := <-v.resultCh:
 			return result
 		case <-time.After(500 * time.Millisecond):
-			return nil
+			// Heartbeat: keeps the polling loop alive while a large file is
+			// being hashed (can take multiple seconds between progress events).
+			// Returning nil here would silently kill the loop and leave any
+			// priority-paused transfer stuck forever.
+			snap := v.tx.Snapshot()
+			return VerifyProgressMsg{
+				TxID:    v.tx.ID,
+				Checked: snap.Verify.FilesChecked,
+				Total:   snap.Verify.FilesTotal,
+			}
 		}
 	}
 }

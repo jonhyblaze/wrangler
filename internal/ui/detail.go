@@ -157,11 +157,9 @@ func (m DetailModel) renderPaused(snap transaction.TxSnapshot, width int) string
 		humanize.Comma(snap.Progress.FilesTotal),
 	))
 	lines = append(lines, "")
-	if isPriorityPaused {
-		lines = append(lines, MutedStyle.Render("[c] cancel"))
-	} else {
-		lines = append(lines, MutedStyle.Render("[p] resume  [c] cancel"))
-	}
+	// Both priority-paused and normally-paused transactions support [p] resume.
+	// For priority-paused, [p] swaps back to the original transfer.
+	lines = append(lines, MutedStyle.Render("[p] resume  [c] cancel"))
 	return strings.Join(lines, "\n")
 }
 

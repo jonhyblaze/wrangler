@@ -33,12 +33,18 @@ type AppModel struct {
 	activeRunner   *transaction.Runner
 	activeVerifier *transaction.Verifier
 
-	// Priority-start state: set when [s] is pressed in the queue panel to run a
-	// specific transaction immediately, pausing the currently active transfer.
-	// After the priority transaction finishes, the paused transfer auto-resumes.
-	pausedRunnerForPriority *transaction.Runner
-	pausedTxForPriority     *transaction.Transaction
-	priorityTxID            string
+	// Pause state: exactly one runner can be paused at a time (via SIGSTOP).
+	// pausedRunner / pausedTx are set on every pause — both manual [p] and
+	// priority-start [s].  priorityTxID is only set for priority-start; when
+	// it is non-empty the paused transfer auto-resumes after the active one
+	// finishes.  For a manual pause priorityTxID stays "".
+	//
+	// INVARIANT: activeRunner points only to a *running* runner (never to a
+	// SIGSTOP-ed one). After any pause, activeRunner is cleared and the runner
+	// is moved here.
+	pausedRunner *transaction.Runner
+	pausedTx     *transaction.Transaction
+	priorityTxID string
 
 	watcher *media.Watcher
 	keys    KeyMap
@@ -105,8 +111,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		// Keep pinging for more progress if runner is still active.
-		if m.activeRunner != nil {
+		// Only restart the polling loop for the currently-active runner.
+		// Stale NextProgressMsg goroutines from a previously-active runner
+		// (e.g. after a priority-swap) must not spawn new loops for the new
+		// active runner — that would cause both transactions to appear active.
+		if m.activeRunner != nil && m.activeRunner.TxID() == msg.TxID {
 			return m, m.activeRunner.NextProgressMsg()
 		}
 		return m, nil
@@ -115,7 +124,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.activeRunner = nil
 		if msg.Err != nil {
 			// Error already recorded in transaction.
-			if m.priorityTxID != "" && msg.TxID == m.priorityTxID {
+			// Resume a paused runner (priority or manual) if one is waiting.
+			if (m.priorityTxID != "" && msg.TxID == m.priorityTxID) || m.pausedRunner != nil {
 				return m, m.tryResumePaused()
 			}
 			return m, m.advanceQueue()
@@ -129,8 +139,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, verifier.NextVerifyMsg()
 			}
 		}
-		// Transaction not found (shouldn't happen) — resume paused or advance.
-		if m.priorityTxID != "" && msg.TxID == m.priorityTxID {
+		// Transaction not found (shouldn't happen).
+		if (m.priorityTxID != "" && msg.TxID == m.priorityTxID) || m.pausedRunner != nil {
 			return m, m.tryResumePaused()
 		}
 		return m, m.advanceQueue()
@@ -147,7 +157,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		if m.activeVerifier != nil {
+		// Guard: only restart the loop for the currently-active verifier.
+		// Stale heartbeats from a previous verifier must not re-spawn loops.
+		if m.activeVerifier != nil && m.activeVerifier.TxID() == msg.TxID {
 			return m, m.activeVerifier.NextVerifyMsg()
 		}
 		return m, nil
@@ -165,8 +177,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		// If this was a priority transaction, auto-resume the paused transfer.
-		if m.priorityTxID != "" && msg.TxID == m.priorityTxID {
+		// If there is a paused runner waiting (priority-paused or manually-paused
+		// while this tx ran), resume it now. For priority-start, priorityTxID
+		// matches; for manual pause, priorityTxID is "" but pausedRunner != nil.
+		if (m.priorityTxID != "" && msg.TxID == m.priorityTxID) || m.pausedRunner != nil {
 			return m, m.tryResumePaused()
 		}
 		// Advance queue to run next queued transaction.
@@ -451,12 +465,31 @@ func (m AppModel) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.activeRunner != nil {
 				if err := m.activeRunner.Pause(); err == nil {
 					_ = tx.SetState(transaction.StatePaused)
+					// Move runner out of activeRunner so advanceQueue / startNow
+					// don't see a running runner.  priorityTxID stays "" (manual
+					// pause — no auto-resume; user must press [p] explicitly).
+					m.pausedRunner = m.activeRunner
+					m.pausedTx = tx
+					m.activeRunner = nil
 				}
 			}
 		case transaction.StatePaused:
-			if m.activeRunner != nil {
-				if err := m.activeRunner.Resume(); err == nil {
+			// If there is an active runner to swap with, do the swap.
+			if m.pausedTx == tx && m.activeRunner != nil {
+				return m.swapPaused()
+			}
+			// Direct resume: either a manual pause, or priority tx already
+			// finished but tryResumePaused somehow didn't fire (fallback).
+			if m.pausedTx == tx && m.pausedRunner != nil {
+				if err := m.pausedRunner.Resume(); err == nil {
 					_ = tx.SetState(transaction.StateRunning)
+					m.activeRunner = m.pausedRunner
+					m.pausedRunner = nil
+					m.pausedTx = nil
+					// Clear any leftover priority state.
+					m.priorityTxID = ""
+					m.queue.SetPriorityPausedID("")
+					m.detail.SetPriorityPausedID("")
 					return m, m.activeRunner.NextProgressMsg()
 				}
 			}
@@ -468,17 +501,17 @@ func (m AppModel) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.activeRunner != nil {
 				m.activeRunner.Cancel()
 				m.activeRunner = nil
-				// If this is the priority tx, RunnerDoneMsg will resume the paused
-				// one. Don't also cancel the paused runner or call advanceQueue here.
+				// If this is the priority tx, RunnerDoneMsg will call
+				// tryResumePaused. Don't touch the paused runner here.
 				if m.priorityTxID != "" && tx.ID == m.priorityTxID {
 					return m, nil
 				}
-				// Non-priority active runner cancelled — also discard any pending
-				// paused-for-priority state so nothing resumes unexpectedly.
-				if m.pausedRunnerForPriority != nil {
-					m.pausedRunnerForPriority.Cancel()
-					m.pausedRunnerForPriority = nil
-					m.pausedTxForPriority = nil
+				// Non-priority active runner cancelled — also discard any paused
+				// runner so nothing resumes unexpectedly.
+				if m.pausedRunner != nil {
+					m.pausedRunner.Cancel()
+					m.pausedRunner = nil
+					m.pausedTx = nil
 					m.priorityTxID = ""
 					m.queue.SetPriorityPausedID("")
 					m.detail.SetPriorityPausedID("")
@@ -487,23 +520,22 @@ func (m AppModel) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 		case transaction.StatePaused:
-			// Check if this is the priority-paused (background) transaction.
-			if m.pausedTxForPriority == tx && m.pausedRunnerForPriority != nil {
-				m.pausedRunnerForPriority.Cancel()
-				tx.SetStateForce(transaction.StateCancelled)
-				m.pausedRunnerForPriority = nil
-				m.pausedTxForPriority = nil
-				m.queue.SetPriorityPausedID("")  // clear the ↩ badge
-				m.detail.SetPriorityPausedID("") // clear detail annotation
-				// The priority transaction is still running; keep priorityTxID so
-				// it can clean up when done, then fall through to advanceQueue.
+			// Cancel the paused runner (both priority-paused and manually-paused
+			// land here — they both use m.pausedRunner now).
+			if m.pausedTx == tx && m.pausedRunner != nil {
+				m.pausedRunner.Cancel()
+				// Cancel() calls SetStateForce(Cancelled) internally.
+				m.pausedRunner = nil
+				m.pausedTx = nil
+				m.queue.SetPriorityPausedID("")
+				m.detail.SetPriorityPausedID("")
+				// If a priority tx is still running, keep priorityTxID — when it
+				// finishes tryResumePaused will see pausedRunner==nil and advance.
+				// If nothing is running, clear priorityTxID too.
+				if m.activeRunner == nil {
+					m.priorityTxID = ""
+				}
 				return m, nil
-			}
-			// Normal user-paused transaction (paused via [p]).
-			if m.activeRunner != nil {
-				m.activeRunner.Cancel()
-				m.activeRunner = nil
-				return m, m.advanceQueue()
 			}
 
 		case transaction.StateQueued:
@@ -574,6 +606,58 @@ func (m AppModel) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// swapPaused swaps the currently-running priority transaction with the
+// priority-paused one. Called when the user presses [p] on the paused-for-
+// priority transaction to toggle back to it. Suspends the current runner via
+// SIGSTOP and resumes the paused runner via SIGCONT, updating all bookkeeping.
+func (m AppModel) swapPaused() (tea.Model, tea.Cmd) {
+	if m.pausedRunner == nil || m.pausedTx == nil || m.activeRunner == nil {
+		return m, nil
+	}
+
+	// Identify the currently running transaction (the one we want to suspend).
+	var activeTx *transaction.Transaction
+	for _, t := range m.transactions {
+		if t.GetState() == transaction.StateRunning {
+			activeTx = t
+			break
+		}
+	}
+	if activeTx == nil {
+		return m, nil
+	}
+
+	// Suspend the currently active runner.
+	if err := m.activeRunner.Pause(); err != nil {
+		// Pause failed (pgid race) — don't corrupt state.
+		return m, nil
+	}
+	_ = activeTx.SetState(transaction.StatePaused)
+
+	// Resume the previously-paused runner.
+	if err := m.pausedRunner.Resume(); err != nil {
+		// Could not resume — undo the suspend.
+		_ = m.activeRunner.Resume()
+		_ = activeTx.SetState(transaction.StateRunning)
+		return m, nil
+	}
+	_ = m.pausedTx.SetState(transaction.StateRunning)
+
+	// Swap: the old paused tx is now the active one; the old active tx is paused.
+	prevPausedRunner := m.pausedRunner
+	prevPausedTx := m.pausedTx
+	m.pausedRunner = m.activeRunner
+	m.pausedTx = activeTx
+	m.activeRunner = prevPausedRunner
+	// The "priority" is now whichever transaction is currently running — when it
+	// finishes, the paused one will be auto-resumed by tryResumePaused.
+	m.priorityTxID = prevPausedTx.ID
+	m.queue.SetPriorityPausedID(activeTx.ID)
+	m.detail.SetPriorityPausedID(activeTx.ID)
+
+	return m, m.activeRunner.NextProgressMsg()
+}
+
 // handleQueuePause toggles pause/resume on the queue-panel cursor transaction.
 func (m AppModel) handleQueuePause() (tea.Model, tea.Cmd) {
 	idx := m.queue.cursor
@@ -587,16 +671,26 @@ func (m AppModel) handleQueuePause() (tea.Model, tea.Cmd) {
 		if m.activeRunner != nil {
 			if err := m.activeRunner.Pause(); err == nil {
 				_ = tx.SetState(transaction.StatePaused)
+				m.pausedRunner = m.activeRunner
+				m.pausedTx = tx
+				m.activeRunner = nil
 			}
 		}
 	case transaction.StatePaused:
-		// Do not manually resume the priority-paused transfer — it auto-resumes.
-		if m.pausedTxForPriority == tx {
-			return m, nil
+		// If there is an active runner to swap with, do the swap.
+		if m.pausedTx == tx && m.activeRunner != nil {
+			return m.swapPaused()
 		}
-		if m.activeRunner != nil {
-			if err := m.activeRunner.Resume(); err == nil {
+		// Direct resume (manual pause, or fallback when priority tx already done).
+		if m.pausedTx == tx && m.pausedRunner != nil {
+			if err := m.pausedRunner.Resume(); err == nil {
 				_ = tx.SetState(transaction.StateRunning)
+				m.activeRunner = m.pausedRunner
+				m.pausedRunner = nil
+				m.pausedTx = nil
+				m.priorityTxID = ""
+				m.queue.SetPriorityPausedID("")
+				m.detail.SetPriorityPausedID("")
 				return m, m.activeRunner.NextProgressMsg()
 			}
 		}
@@ -618,13 +712,13 @@ func (m AppModel) handleQueueCancel() (tea.Model, tea.Cmd) {
 			m.activeRunner.Cancel()
 			m.activeRunner = nil
 			if m.priorityTxID != "" && tx.ID == m.priorityTxID {
-				// Priority tx cancelled — RunnerDoneMsg will resume the paused one.
+				// Priority tx cancelled — RunnerDoneMsg will call tryResumePaused.
 				return m, nil
 			}
-			if m.pausedRunnerForPriority != nil {
-				m.pausedRunnerForPriority.Cancel()
-				m.pausedRunnerForPriority = nil
-				m.pausedTxForPriority = nil
+			if m.pausedRunner != nil {
+				m.pausedRunner.Cancel()
+				m.pausedRunner = nil
+				m.pausedTx = nil
 				m.priorityTxID = ""
 				m.queue.SetPriorityPausedID("")
 				m.detail.SetPriorityPausedID("")
@@ -633,21 +727,18 @@ func (m AppModel) handleQueueCancel() (tea.Model, tea.Cmd) {
 		}
 
 	case transaction.StatePaused:
-		// Priority-paused transfer: cancel the background runner directly.
-		if m.pausedTxForPriority == tx && m.pausedRunnerForPriority != nil {
-			m.pausedRunnerForPriority.Cancel()
-			tx.SetStateForce(transaction.StateCancelled)
-			m.pausedRunnerForPriority = nil
-			m.pausedTxForPriority = nil
+		// Cancel the paused runner (priority-paused and manually-paused both
+		// live in m.pausedRunner now).
+		if m.pausedTx == tx && m.pausedRunner != nil {
+			m.pausedRunner.Cancel()
+			m.pausedRunner = nil
+			m.pausedTx = nil
 			m.queue.SetPriorityPausedID("")
 			m.detail.SetPriorityPausedID("")
+			if m.activeRunner == nil {
+				m.priorityTxID = ""
+			}
 			return m, nil
-		}
-		// Normal user-paused transfer.
-		if m.activeRunner != nil {
-			m.activeRunner.Cancel()
-			m.activeRunner = nil
-			return m, m.advanceQueue()
 		}
 
 	case transaction.StateQueued:
@@ -678,8 +769,8 @@ func (m AppModel) startNow(tx *transaction.Transaction) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Do not allow nesting priority starts — one paused runner at a time.
-	if m.pausedRunnerForPriority != nil {
+	// Do not allow nesting — one paused runner at a time.
+	if m.pausedRunner != nil {
 		return m, nil
 	}
 
@@ -706,8 +797,8 @@ func (m AppModel) startNow(tx *transaction.Transaction) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		_ = runningTx.SetState(transaction.StatePaused)
-		m.pausedRunnerForPriority = m.activeRunner
-		m.pausedTxForPriority = runningTx
+		m.pausedRunner = m.activeRunner
+		m.pausedTx = runningTx
 		// Mark the paused transaction in queue and detail views (↩ badge).
 		m.queue.SetPriorityPausedID(runningTx.ID)
 		m.detail.SetPriorityPausedID(runningTx.ID)
@@ -730,17 +821,17 @@ func (m *AppModel) tryResumePaused() tea.Cmd {
 	m.queue.SetPriorityPausedID("")  // clear the ↩ badge
 	m.detail.SetPriorityPausedID("") // clear detail annotation
 
-	runner := m.pausedRunnerForPriority
-	tx := m.pausedTxForPriority
-	m.pausedRunnerForPriority = nil
-	m.pausedTxForPriority = nil
+	runner := m.pausedRunner
+	tx := m.pausedTx
+	m.pausedRunner = nil
+	m.pausedTx = nil
 
 	if runner == nil || tx == nil {
 		return m.advanceQueue()
 	}
 
 	// The paused transaction may have been cancelled by the user while the
-	// priority transfer was running — respect that and advance the queue instead.
+	// active transfer was running — respect that and advance the queue instead.
 	s := tx.GetState()
 	if s == transaction.StateCancelled || s == transaction.StateFailed {
 		return m.advanceQueue()
@@ -762,9 +853,11 @@ func (m *AppModel) tryResumePaused() tea.Cmd {
 	return runner.NextProgressMsg()
 }
 
-// advanceQueue starts the next QUEUED transaction if nothing is running.
+// advanceQueue starts the next QUEUED transaction if nothing is active or paused.
+// A paused runner means the user deliberately suspended a transfer; don't start
+// more work behind their back — they must resume or cancel it first.
 func (m *AppModel) advanceQueue() tea.Cmd {
-	if m.activeRunner != nil {
+	if m.activeRunner != nil || m.pausedRunner != nil {
 		return nil
 	}
 	for _, tx := range m.transactions {
@@ -987,13 +1080,9 @@ func (m AppModel) renderFooter() string {
 				parts = append(parts, MutedStyle.Render("[p]")+" pause")
 				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
 			case transaction.StatePaused:
-				if m.pausedTxForPriority == tx {
-					// Auto-resume pending — only cancel available.
-					parts = append(parts, MutedStyle.Render("[c]")+" cancel")
-				} else {
-					parts = append(parts, MutedStyle.Render("[p]")+" resume")
-					parts = append(parts, MutedStyle.Render("[c]")+" cancel")
-				}
+				// Both priority-paused and normally-paused support [p] to resume/swap.
+				parts = append(parts, MutedStyle.Render("[p]")+" resume")
+				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
 			case transaction.StateDone:
 				parts = append(parts, MutedStyle.Render("[r]")+" open report")
 			case transaction.StateQueued:
@@ -1016,12 +1105,9 @@ func (m AppModel) renderFooter() string {
 				parts = append(parts, MutedStyle.Render("[p]")+" pause")
 				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
 			case transaction.StatePaused:
-				if m.pausedTxForPriority == tx {
-					parts = append(parts, MutedStyle.Render("[c]")+" cancel")
-				} else {
-					parts = append(parts, MutedStyle.Render("[p]")+" resume")
-					parts = append(parts, MutedStyle.Render("[c]")+" cancel")
-				}
+				// Both priority-paused and normally-paused support [p] to resume/swap.
+				parts = append(parts, MutedStyle.Render("[p]")+" resume")
+				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
 			}
 		}
 		parts = append(parts, MutedStyle.Render("[n]")+" new")
