@@ -17,9 +17,9 @@ const (
 	// popupOuterW is the total outer width of the popup (border + padding + content).
 	// With 1-char border each side and 1-char padding each side:
 	//   inner content width = popupOuterW - 2 (border) - 2 (padding) = popupInnerW
-	popupOuterW = 72
-	popupInnerW = 64 // popupOuterW - 4
-	popupLabelW = 12
+	popupOuterW = 64
+	popupInnerW = 60 // popupOuterW - 4
+	popupLabelW = 14
 )
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -81,8 +81,12 @@ var popupStyle = lipgloss.NewStyle().
 func (m InfoPopupModel) View() string {
 	var sb strings.Builder
 
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorText)
-	sep := DimStyle.Render(strings.Repeat("─", popupInnerW))
+	// Every render call inside the popup must carry Background(ColorSurface).
+	// Lipgloss emits an ANSI reset after each Render(), which would make any
+	// following plain text or Width() padding transparent without an explicit bg.
+	bg := ColorSurface
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorText).Background(bg)
+	sep := DimStyle.Background(bg).Render(strings.Repeat("─", popupInnerW))
 
 	sb.WriteString(titleStyle.Render("INFO"))
 	sb.WriteString("\n")
@@ -91,27 +95,29 @@ func (m InfoPopupModel) View() string {
 
 	if m.loading {
 		frame := spinnerFrames[m.spinFrame%len(spinnerFrames)]
-		sb.WriteString(AmberStyle.Render(frame + "  Loading…"))
+		sb.WriteString(AmberStyle.Background(bg).Render(frame + "  Loading…"))
 		sb.WriteString("\n")
 	} else if m.info == nil || m.info.NotFound {
-		sb.WriteString(RedStyle.Render("  File not found."))
+		sb.WriteString(RedStyle.Background(bg).Render("  File not found."))
 		sb.WriteString("\n")
 	} else {
 		writeInfoContent(&sb, m.info)
 	}
 
-	// Footer.
+	// Footer rows — Width(popupInnerW) pads to full width; background must be
+	// set on the style itself or the padding spaces will be transparent.
+	footerRow := func(style lipgloss.Style, text string) string {
+		return style.Background(bg).Width(popupInnerW).Render(text)
+	}
 	sb.WriteString("\n")
 	if m.copiedKey != "" {
-		sb.WriteString(GreenStyle.Render("✓ Copied " + m.copiedKey))
+		sb.WriteString(footerRow(GreenStyle, "✓ Copied "+m.copiedKey))
 		sb.WriteString("\n")
 	} else if m.info != nil && !m.info.NotFound {
-		sb.WriteString(MutedStyle.Render("[s] set source  [d] add dest  [c] copy path"))
+		sb.WriteString(footerRow(MutedStyle, "[s] set source  [d] add dest  [c] copy path"))
 		sb.WriteString("\n")
-		sb.WriteString(MutedStyle.Render("[b] copy breadcrumb  [m] copy full meta"))
-		sb.WriteString("\n")
+		sb.WriteString(footerRow(MutedStyle, "[b] copy breadcrumb  [m] copy full meta  [esc / i] close"))
 	}
-	sb.WriteString(MutedStyle.Render("[esc] / [i]  close"))
 
 	return popupStyle.Width(popupOuterW).Render(sb.String())
 }
@@ -120,12 +126,15 @@ func (m InfoPopupModel) View() string {
 func writeInfoContent(sb *strings.Builder, i *meta.Meta) {
 	// Breadcrumb path.
 	bc := meta.Breadcrumb(i.Path, popupInnerW)
-	sb.WriteString(AmberStyle.Render(bc))
+	sb.WriteString(AmberStyle.Background(ColorSurface).Render(bc))
 	sb.WriteString("\n\n")
 
 	// ── Common fields ─────────────────────────────────────────────────────────
 	writeField(sb, "Kind", i.Kind)
 	writeField(sb, "Size", popupFormatSize(i))
+	if i.VolumeFree > 0 || i.VolumeTotal > 0 {
+		writeField(sb, "Space", popupFormatSpace(i))
+	}
 	if !i.Modified.IsZero() {
 		writeField(sb, "Modified", popupFormatDate(i.Modified))
 	}
@@ -245,11 +254,12 @@ func writeInfoContent(sb *strings.Builder, i *meta.Meta) {
 }
 
 // writeField writes one label + value row.
+// Every segment is rendered with Background(ColorSurface) so there are no
+// transparent gaps between the label, the separator space, and the value.
 func writeField(sb *strings.Builder, label, value string) {
 	if value == "" {
 		return
 	}
-	lbl := MutedStyle.Render(fmt.Sprintf("%-*s", popupLabelW, label))
 	maxVal := popupInnerW - popupLabelW - 1
 	if maxVal < 4 {
 		maxVal = 4
@@ -258,10 +268,29 @@ func writeField(sb *strings.Builder, label, value string) {
 	if len(value) > maxVal {
 		value = value[:maxVal-1] + "…"
 	}
-	sb.WriteString(lbl + " " + value + "\n")
+	lbl := lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		Background(ColorSurface).
+		Render(fmt.Sprintf("%-*s", popupLabelW, label))
+	gap := lipgloss.NewStyle().Background(ColorSurface).Render(" ")
+	val := lipgloss.NewStyle().Background(ColorSurface).Render(value)
+	sb.WriteString(lbl + gap + val + "\n")
 }
 
 // ── Render helpers ────────────────────────────────────────────────────────────
+
+func popupFormatSpace(m *meta.Meta) string {
+	if m.VolumeFree > 0 && m.VolumeTotal > 0 {
+		return humanize.Bytes(m.VolumeFree) + " / " + humanize.Bytes(m.VolumeTotal)
+	}
+	if m.VolumeFree > 0 {
+		return humanize.Bytes(m.VolumeFree) + " free"
+	}
+	if m.VolumeTotal > 0 {
+		return humanize.Bytes(m.VolumeTotal) + " total"
+	}
+	return ""
+}
 
 func popupFormatSize(m *meta.Meta) string {
 	if m.Type == meta.FileTypeFolder {

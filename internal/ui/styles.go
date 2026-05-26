@@ -19,6 +19,12 @@ const (
 	ColorRed     = lipgloss.Color("#E05252")
 	ColorBlue    = lipgloss.Color("#5B9BD5")
 	ColorWhite   = lipgloss.Color("#FFFFFF")
+
+	// Space-badge colours for volume free-space annotations.
+	ColorSpaceBgGreen = lipgloss.Color("#2D5A3D") // dark green background
+	ColorSpaceBgAmber = lipgloss.Color("#5A4000") // dark amber background
+	ColorSpaceBgRed   = lipgloss.Color("#5A1A1A") // dark red background
+	ColorSpaceFg      = lipgloss.Color("#C8C8C8") // light neutral foreground
 )
 
 // StateColor returns the Lipgloss color for a given transaction state.

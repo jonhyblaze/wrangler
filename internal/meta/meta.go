@@ -46,6 +46,10 @@ type Meta struct {
 	SizeOnDisk int64
 	Bitrate    int64
 
+	// Volume space (populated via syscall.Statfs — fast, works for drives).
+	VolumeFree  int64
+	VolumeTotal int64
+
 	// Timestamps.
 	Created  time.Time
 	Modified time.Time
@@ -122,6 +126,14 @@ func fetch(path string) *Meta {
 	}
 
 	m.Volume, m.Filesystem = volumeInfo(path)
+
+	// Volume free / total space via Statfs (fast, reliable for drives and folders).
+	var stfs syscall.Statfs_t
+	if syscall.Statfs(path, &stfs) == nil {
+		bsize := int64(stfs.Bsize)
+		m.VolumeTotal = int64(stfs.Blocks) * bsize
+		m.VolumeFree = int64(stfs.Bavail) * bsize
+	}
 
 	if info.IsDir() {
 		m.Type = FileTypeFolder

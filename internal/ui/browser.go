@@ -45,6 +45,7 @@ type browserEntry struct {
 	isVolume     bool
 	isCameraCard bool
 	freeBytes    int64
+	totalBytes   int64
 }
 
 // BrowserModel is the file browser panel state.
@@ -141,6 +142,7 @@ func (m *BrowserModel) reloadDir() {
 					e.isVolume = true
 					e.isCameraCard = v.IsCamera
 					e.freeBytes = v.FreeBytes
+					e.totalBytes = v.TotalBytes
 					break
 				}
 			}
@@ -183,6 +185,7 @@ func (m BrowserModel) all() []browserEntry {
 			isVolume:     true,
 			isCameraCard: v.IsCamera,
 			freeBytes:    v.FreeBytes,
+			totalBytes:   v.TotalBytes,
 		})
 	}
 
@@ -541,10 +544,13 @@ func (m BrowserModel) renderEntry(e browserEntry, idx int, width int) string {
 		label = label[:width-1]
 	}
 
-	// Right-side annotation (free space for volumes).
+	// Right-side annotation (free space for volumes) — coloured badge.
+	// The gap uses an explicit background so it matches the panel surface
+	// instead of appearing transparent.
 	annotation := ""
 	if e.isVolume && e.freeBytes > 0 {
-		annotation = MutedStyle.Render("  " + humanize.Bytes(e.freeBytes))
+		gap := lipgloss.NewStyle().Background(ColorSurface).Render(" ")
+		annotation = gap + renderSpaceBadge(e.freeBytes, e.totalBytes)
 	}
 
 	// Choose row style.
@@ -573,4 +579,39 @@ func (m BrowserModel) renderEntry(e browserEntry, idx int, width int) string {
 	}
 
 	return style.Render(label) + annotation
+}
+
+// renderSpaceBadge returns a coloured " free / total " pill for volume entries.
+// Background colour reflects available space:
+//   - Red   (<10 % free)
+//   - Amber (10–50 % free)
+//   - Green (>50 % free)
+//
+// Foreground is a light neutral so it's legible on all three backgrounds.
+func renderSpaceBadge(free, total int64) string {
+	text := humanize.Bytes(free)
+	if total > 0 {
+		text += " / " + humanize.Bytes(total)
+	}
+
+	var pct float64
+	if total > 0 {
+		pct = float64(free) / float64(total)
+	}
+
+	var bg lipgloss.Color
+	switch {
+	case pct > 0.50:
+		bg = ColorSpaceBgGreen
+	case pct > 0.10:
+		bg = ColorSpaceBgAmber
+	default:
+		bg = ColorSpaceBgRed
+	}
+
+	return lipgloss.NewStyle().
+		Background(bg).
+		Foreground(ColorSpaceFg).
+		Padding(0, 1).
+		Render(text)
 }
