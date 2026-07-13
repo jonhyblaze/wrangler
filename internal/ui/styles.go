@@ -27,14 +27,14 @@ const (
 	ColorSpaceFg      = lipgloss.Color("#C8C8C8") // light neutral foreground
 )
 
-// PanelFrameWidth is the number of columns a panel's frame steals from the
-// text a sub-model can draw. app.go renders each panel with
-// PanelStyle.Width(col-4); PanelStyle then reserves Padding(0,1) = 2 more
-// columns *inside* that width. Sub-models receive m.width == col, so their
-// usable text width is col - PanelFrameWidth. Drawing wider than this makes
-// Lipgloss soft-wrap the line, which adds rows, grows the panel past its
-// siblings, and shifts the surrounding borders.
-const PanelFrameWidth = 6
+// PanelFrameWidth is the total horizontal overhead of a panel's frame:
+// NormalBorder (1 col each side = 2) + Padding(0,1) (1 col each side = 2) = 4.
+// app.go renders each panel with PanelStyle.Width(col-2) so the outer width
+// equals its allocated column `col` (Lipgloss adds the 2 border cols outside
+// the width); the usable text area is then col - PanelFrameWidth. Sub-models
+// receive m.width == col, so they must draw no wider than m.width -
+// PanelFrameWidth — anything wider soft-wraps, adds rows, and shifts borders.
+const PanelFrameWidth = 4
 
 // StateColor returns the Lipgloss color for a given transaction state.
 func StateColor(s transaction.State) lipgloss.Color {
@@ -112,6 +112,22 @@ var (
 			Background(ColorSurface).
 			Foreground(ColorMuted).
 			Padding(0, 1)
+
+	// Footer segment styles. Every visible piece of the footer carries the
+	// surface background explicitly so the row renders as one solid bar. If a
+	// segment omitted the background, the Render's trailing \e[0m reset would
+	// clear it and leave the following text on the terminal's default (black)
+	// background — the "black rectangle" / inconsistent-[tab] artefact.
+	FooterKeyStyle = lipgloss.NewStyle().
+			Foreground(ColorMuted).
+			Background(ColorSurface)
+
+	FooterDescStyle = lipgloss.NewStyle().
+			Foreground(ColorText).
+			Background(ColorSurface)
+
+	FooterSepStyle = lipgloss.NewStyle().
+			Background(ColorSurface)
 
 	PanelTitleStyle = lipgloss.NewStyle().
 			Foreground(ColorMuted).

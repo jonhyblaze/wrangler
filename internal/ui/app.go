@@ -937,24 +937,26 @@ func (m AppModel) View() string {
 		queueStyle = PanelStyle
 	}
 
-	// Lipgloss Width/Height are inner *content* dimensions (not outer):
-	//   • Height(contentH - 2): the two border rows add on top → total outer = contentH.
-	//   • Width(xw - 4): PanelStyle has NormalBorder (2 cols) + Padding(0,1) (2 cols)
-	//     = 4 cols of horizontal overhead. Passing the raw column allocation without
-	//     subtracting 4 makes each panel 4 chars wider than its slot, overflowing the
-	//     terminal by 12 chars total and pushing the queue panel's right border off-screen.
+	// Lipgloss adds the border (2 cols / 2 rows) *outside* the width/height, but
+	// counts Padding *inside* them. So to make a panel's OUTER size exactly fill
+	// its allocated column `xw` and the content row height `contentH`:
+	//   • Width(xw - 2):  outer = (xw-2) + 2 border = xw. The three panels then
+	//     sum to exactly m.width, matching the full-width header and footer.
+	//   • Height(contentH - 2): outer = (contentH-2) + 2 border = contentH.
+	// The usable text area is xw - PanelFrameWidth (the extra 2 is Padding), which
+	// is what each sub-model draws to (see m.width - PanelFrameWidth in their View).
 	browserPanel := browserStyle.
-		Width(bw - 4).
+		Width(bw - 2).
 		Height(contentH - 2).
 		Render(bm.View())
 
 	detailPanel := detailStyle.
-		Width(dw - 4).
+		Width(dw - 2).
 		Height(contentH - 2).
 		Render(dm.View())
 
 	queuePanel := queueStyle.
-		Width(qw - 4).
+		Width(qw - 2).
 		Height(contentH - 2).
 		Render(qm.View())
 
@@ -1051,74 +1053,79 @@ func (m AppModel) renderHeader() string {
 // renderFooter renders the bottom keybinding footer.
 func (m AppModel) renderFooter() string {
 	var parts []string
+	// add renders one "[key] description" hint. Both halves carry the surface
+	// background so the whole footer stays one solid bar (see FooterKeyStyle).
+	add := func(key, desc string) {
+		parts = append(parts, FooterKeyStyle.Render(key)+FooterDescStyle.Render(" "+desc))
+	}
 
-	parts = append(parts, MutedStyle.Render("[tab]")+" panels")
+	add("[tab]", "panels")
 
 	switch m.activePanel {
 	case PanelBrowser:
 		if m.browser.confirmEject {
-			parts = append(parts, MutedStyle.Render("[y]")+" confirm eject")
-			parts = append(parts, MutedStyle.Render("[f]")+" force")
-			parts = append(parts, MutedStyle.Render("[esc]")+" cancel")
+			add("[y]", "confirm eject")
+			add("[f]", "force")
+			add("[esc]", "cancel")
 		} else if m.browser.selectingDest {
-			parts = append(parts, MutedStyle.Render("[space]")+" set dest")
-			parts = append(parts, MutedStyle.Render("[→/enter]")+" open dir")
-			parts = append(parts, MutedStyle.Render("[←/bksp]")+" parent")
-			parts = append(parts, MutedStyle.Render("[esc]")+" cancel")
+			add("[space]", "set dest")
+			add("[→/enter]", "open dir")
+			add("[←/bksp]", "parent")
+			add("[esc]", "cancel")
 		} else {
-			parts = append(parts, MutedStyle.Render("[space]")+" set source")
-			parts = append(parts, MutedStyle.Render("[→/enter]")+" open dir")
-			parts = append(parts, MutedStyle.Render("[←/bksp]")+" parent")
-			parts = append(parts, MutedStyle.Render("[i]")+" info")
-			parts = append(parts, MutedStyle.Render("[~]")+" home")
-			parts = append(parts, MutedStyle.Render("[v]")+" /Volumes")
-			parts = append(parts, MutedStyle.Render("[e]")+" eject")
+			add("[space]", "set source")
+			add("[→/enter]", "open dir")
+			add("[←/bksp]", "parent")
+			add("[i]", "info")
+			add("[~]", "home")
+			add("[v]", "/Volumes")
+			add("[e]", "eject")
 		}
 	case PanelDetail:
 		if m.focusedTxIndex >= 0 && m.focusedTxIndex < len(m.transactions) {
 			tx := m.transactions[m.focusedTxIndex]
-			state := tx.GetState()
-			switch state {
+			switch tx.GetState() {
 			case transaction.StateRunning:
-				parts = append(parts, MutedStyle.Render("[p]")+" pause")
-				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
+				add("[p]", "pause")
+				add("[c]", "cancel")
 			case transaction.StatePaused:
 				// Both priority-paused and normally-paused support [p] to resume/swap.
-				parts = append(parts, MutedStyle.Render("[p]")+" resume")
-				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
+				add("[p]", "resume")
+				add("[c]", "cancel")
 			case transaction.StateDone:
-				parts = append(parts, MutedStyle.Render("[r]")+" open report")
+				add("[r]", "open report")
 			case transaction.StateQueued:
-				parts = append(parts, MutedStyle.Render("[s]")+" start")
-				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
+				add("[s]", "start")
+				add("[c]", "cancel")
 			}
 		}
-		parts = append(parts, MutedStyle.Render("[n]")+" new")
+		add("[n]", "new")
 
 	case PanelQueue:
-		parts = append(parts, MutedStyle.Render("[enter]")+" focus")
+		add("[enter]", "focus")
 		if m.queue.cursor >= 0 && m.queue.cursor < len(m.transactions) {
 			tx := m.transactions[m.queue.cursor]
-			state := tx.GetState()
-			switch state {
+			switch tx.GetState() {
 			case transaction.StateQueued:
-				parts = append(parts, MutedStyle.Render("[s]")+" start")
-				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
+				add("[s]", "start")
+				add("[c]", "cancel")
 			case transaction.StateRunning:
-				parts = append(parts, MutedStyle.Render("[p]")+" pause")
-				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
+				add("[p]", "pause")
+				add("[c]", "cancel")
 			case transaction.StatePaused:
 				// Both priority-paused and normally-paused support [p] to resume/swap.
-				parts = append(parts, MutedStyle.Render("[p]")+" resume")
-				parts = append(parts, MutedStyle.Render("[c]")+" cancel")
+				add("[p]", "resume")
+				add("[c]", "cancel")
 			}
 		}
-		parts = append(parts, MutedStyle.Render("[n]")+" new")
+		add("[n]", "new")
 	}
 
-	parts = append(parts, MutedStyle.Render("[q]")+" quit ")
+	add("[q]", "quit")
 
-	footer := strings.Join(parts, "  ")
+	// Join with a surface-backgrounded separator so the gaps between hints stay
+	// the same colour as everything else.
+	footer := strings.Join(parts, FooterSepStyle.Render("  "))
 	return FooterStyle.Width(m.width).Render(footer)
 }
 
