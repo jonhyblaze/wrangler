@@ -519,9 +519,20 @@ func (m BrowserModel) renderEntry(e browserEntry, idx int, width int) string {
 		}
 	}
 
-	// Build icon + label.
+	// Plain display name (trailing slash for real directories).
+	plain := e.name
+	if e.isDir && !e.isParent {
+		plain += "/"
+	}
+
+	// Choose the leading icon. Source/dest markers take priority so the
+	// selection state is obvious; otherwise fall back to the type icon.
 	var icon string
 	switch {
+	case isSource:
+		icon = "→ "
+	case isDest:
+		icon = "✓ "
 	case e.isParent:
 		icon = "↑ "
 	case e.isCameraCard:
@@ -536,10 +547,7 @@ func (m BrowserModel) renderEntry(e browserEntry, idx int, width int) string {
 		icon = "    "
 	}
 
-	label := icon + e.name
-	if e.isDir && !e.isParent {
-		label += "/"
-	}
+	label := icon + plain
 	if len(label) > width-1 {
 		label = label[:width-1]
 	}
@@ -557,14 +565,8 @@ func (m BrowserModel) renderEntry(e browserEntry, idx int, width int) string {
 	var style lipgloss.Style
 	switch {
 	case isSource:
-		icon = "→ "
-		plain := strings.TrimLeft(label, " ↑▸[CDM~] ")
-		label = icon + plain
 		style = lipgloss.NewStyle().Foreground(ColorAmber).Bold(true)
 	case isDest:
-		icon = "✓ "
-		plain := strings.TrimLeft(label, " ↑▸[CDM~] ")
-		label = icon + plain
 		style = lipgloss.NewStyle().Foreground(ColorGreen).Bold(true)
 	case selected && e.isDir:
 		style = ActiveItemStyle
