@@ -66,6 +66,11 @@ type Runner struct {
 	prevBytes  int64 // bytes already done in completed destinations
 	totalBytes int64 // source_size × destCount (for smooth overall progress bar)
 	totalFiles int64
+
+	// destPreexisting records, per destination, whether dest/basename(source)
+	// already existed before this transfer started. On cancel we only delete
+	// folders we created ourselves — never pre-existing user data.
+	destPreexisting map[string]bool
 }
 
 // NewRunner creates a new Runner for the given transaction.
@@ -73,10 +78,11 @@ func NewRunner(tx *Transaction) *Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		tx:         tx,
-		progressCh: make(chan TransferProgress, 20),
-		doneCh:     make(chan error, 1),
-		cancelCtx:  ctx,
-		cancelFn:   cancel,
+		progressCh:      make(chan TransferProgress, 20),
+		doneCh:          make(chan error, 1),
+		cancelCtx:       ctx,
+		cancelFn:        cancel,
+		destPreexisting: make(map[string]bool),
 	}
 }
 
@@ -105,6 +111,17 @@ func (r *Runner) Start() {
 			}
 		}
 
+		// Record which destination folders already existed, so a later cancel
+		// only removes folders this transfer created (never pre-existing data).
+		srcName := filepath.Base(r.tx.Source)
+		r.mu.Lock()
+		for _, dest := range r.tx.Destinations {
+			if _, statErr := os.Stat(filepath.Join(dest, srcName)); statErr == nil {
+				r.destPreexisting[dest] = true
+			}
+		}
+		r.mu.Unlock()
+
 		// Publish initial progress (0 done).
 		r.tx.UpdateProgress(TransferProgress{
 			BytesTotal: r.totalBytes,
@@ -127,6 +144,13 @@ func (r *Runner) Start() {
 			close(pollerDone) // stop poller regardless of rsync result
 
 			if rsyncErr != nil {
+				// A cancelled context means the user aborted this transfer.
+				// Cancel() owns the terminal state (StateCancelled) and cleanup —
+				// don't overwrite it with StateFailed / a "context canceled" error.
+				if r.cancelCtx.Err() != nil {
+					r.doneCh <- rsyncErr
+					return
+				}
 				r.tx.SetError(fmt.Errorf("rsync to %s failed: %w", dest, rsyncErr))
 				r.doneCh <- rsyncErr
 				return
@@ -406,6 +430,7 @@ func (r *Runner) Cancel() {
 	r.mu.Lock()
 	pgid := r.pgid
 	dests := r.tx.Destinations
+	preexisting := r.destPreexisting
 	r.mu.Unlock()
 
 	if pgid != 0 {
@@ -414,8 +439,20 @@ func (r *Runner) Cancel() {
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	}
 
+	// Clean up everything this transfer wrote so cancel leaves the destination
+	// as it was: the in-progress temp/partial scratch dir, and the copied
+	// source folder itself (dest/basename(source)) — otherwise an aborted copy
+	// masquerades as a complete one.
+	//
+	// Only delete the copied folder when this transfer created it. If a folder
+	// of the same name already existed before we started, leave it untouched —
+	// we can't tell our partial writes from the user's pre-existing data.
+	srcName := filepath.Base(r.tx.Source)
 	for _, dest := range dests {
 		_ = os.RemoveAll(filepath.Join(dest, ".wrangler_partial"))
+		if !preexisting[dest] {
+			_ = os.RemoveAll(filepath.Join(dest, srcName))
+		}
 	}
 
 	r.tx.SetStateForce(StateCancelled)

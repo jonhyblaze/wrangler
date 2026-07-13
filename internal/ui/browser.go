@@ -425,7 +425,7 @@ func (m *BrowserModel) ConfirmEject() string {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m BrowserModel) View() string {
-	innerWidth := m.width - 4
+	innerWidth := m.width - PanelFrameWidth
 	if innerWidth < 8 {
 		innerWidth = 8
 	}

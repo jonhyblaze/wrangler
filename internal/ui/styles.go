@@ -27,6 +27,15 @@ const (
 	ColorSpaceFg      = lipgloss.Color("#C8C8C8") // light neutral foreground
 )
 
+// PanelFrameWidth is the number of columns a panel's frame steals from the
+// text a sub-model can draw. app.go renders each panel with
+// PanelStyle.Width(col-4); PanelStyle then reserves Padding(0,1) = 2 more
+// columns *inside* that width. Sub-models receive m.width == col, so their
+// usable text width is col - PanelFrameWidth. Drawing wider than this makes
+// Lipgloss soft-wrap the line, which adds rows, grows the panel past its
+// siblings, and shifts the surrounding borders.
+const PanelFrameWidth = 6
+
 // StateColor returns the Lipgloss color for a given transaction state.
 func StateColor(s transaction.State) lipgloss.Color {
 	switch s {

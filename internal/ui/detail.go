@@ -37,7 +37,7 @@ func (m *DetailModel) SetPriorityPausedID(id string) {
 
 // View renders the detail panel.
 func (m DetailModel) View() string {
-	innerWidth := m.width - 4
+	innerWidth := m.width - PanelFrameWidth
 	if innerWidth < 10 {
 		innerWidth = 10
 	}

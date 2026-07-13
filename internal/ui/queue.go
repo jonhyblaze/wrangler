@@ -76,7 +76,7 @@ func (m *QueueModel) SetPriorityPausedID(id string) {
 
 // View renders the queue panel.
 func (m QueueModel) View() string {
-	innerWidth := m.width - 4
+	innerWidth := m.width - PanelFrameWidth
 	if innerWidth < 10 {
 		innerWidth = 10
 	}
