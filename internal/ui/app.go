@@ -937,21 +937,24 @@ func (m AppModel) View() string {
 		queueStyle = PanelStyle
 	}
 
-	// Height(contentH - 2): Lipgloss Height is the inner content height; the
-	// two border rows (top + bottom) are added on top of it. Passing contentH
-	// directly would overflow the terminal by 2 rows, hiding the header.
+	// Lipgloss Width/Height are inner *content* dimensions (not outer):
+	//   • Height(contentH - 2): the two border rows add on top → total outer = contentH.
+	//   • Width(xw - 4): PanelStyle has NormalBorder (2 cols) + Padding(0,1) (2 cols)
+	//     = 4 cols of horizontal overhead. Passing the raw column allocation without
+	//     subtracting 4 makes each panel 4 chars wider than its slot, overflowing the
+	//     terminal by 12 chars total and pushing the queue panel's right border off-screen.
 	browserPanel := browserStyle.
-		Width(bw).
+		Width(bw - 4).
 		Height(contentH - 2).
 		Render(bm.View())
 
 	detailPanel := detailStyle.
-		Width(dw).
+		Width(dw - 4).
 		Height(contentH - 2).
 		Render(dm.View())
 
 	queuePanel := queueStyle.
-		Width(qw).
+		Width(qw - 4).
 		Height(contentH - 2).
 		Render(qm.View())
 
